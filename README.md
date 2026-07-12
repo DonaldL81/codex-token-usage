@@ -29,6 +29,14 @@ Codex Token Usage 是一个面向个人本机的 Codex token 观察工具。
 
 ## 4. 安装和启动
 
+通过 Codex Skill 安装或打开最新 portable 版本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File skills/codex-token-usage-skill/scripts/download-codex-token-usage.ps1
+```
+
+该入口会读取 GitHub Latest Release，下载最新 `CodexTokenUsage-*-windows-x64-portable.exe`，并安装到 `%LOCALAPPDATA%\Programs\CodexTokenUsage\CodexTokenUsage.exe`。
+
 ```powershell
 cd app
 npm install

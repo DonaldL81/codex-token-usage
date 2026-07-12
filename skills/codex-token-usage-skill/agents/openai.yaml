@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Token Usage Skill"
+  short_description: "Install, open, or update Codex Token Usage for Windows."
+  default_prompt: "Use $codex-token-usage-skill to install and open the latest Codex Token Usage portable version."
