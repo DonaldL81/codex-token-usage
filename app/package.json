@@ -1,0 +1,29 @@
+{
+  "name": "codex-token-usage",
+  "version": "0.3.11",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build:debug": "tauri build --debug",
+    "desktop:build": "tauri build",
+    "sync:version": "powershell -ExecutionPolicy Bypass -File scripts/Sync-Version.ps1",
+    "package:portable": "powershell -ExecutionPolicy Bypass -File scripts/Package-Portable.ps1",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "verify:release": "powershell -ExecutionPolicy Bypass -File scripts/Verify-Release.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "svelte": "5.56.4"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.2.0",
+    "@tauri-apps/cli": "2.11.4",
+    "typescript": "5.9.2",
+    "vite": "8.1.4"
+  }
+}

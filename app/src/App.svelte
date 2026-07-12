@@ -1,0 +1,1863 @@
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { onDestroy, onMount, tick } from "svelte";
+
+  type Page = "detail" | "stats";
+
+  type UsageFilters = {
+    dateFrom: string;
+    dateTo: string;
+    project: string;
+    session: string;
+    search: string;
+    onlyAnomalies: boolean;
+  };
+
+  type ScanState = {
+    lastCutoffUtc: string | null;
+    lastRunUtc: string | null;
+    sessionsRoot: string;
+    ledgerTokenEvents: number;
+    lastRunNewTokenEvents: number;
+    lastRunFilesScanned: number;
+    lastRunParseErrors: number;
+    includeArchived: boolean;
+    error: string | null;
+  };
+
+  type AppConfig = {
+    sessionsRoot: string;
+    includeArchived: boolean;
+    refreshIntervalSeconds: number;
+    includeMessagesInExport: boolean;
+    retentionDays: number;
+    updateSource: string;
+  };
+
+  type ExportResult = {
+    path: string;
+    rowCount: number;
+  };
+
+  type RebuildResult = {
+    backupPath: string | null;
+    scanState: ScanState;
+  };
+
+  type UpdateInfo = {
+    currentVersion: string;
+    source: string;
+    latestVersion: string | null;
+    releaseName: string | null;
+    publishedAt: string | null;
+    releaseNotes: string | null;
+    downloadUrl: string | null;
+    releasePageUrl: string | null;
+    hasUpdate: boolean;
+    message: string;
+  };
+
+  type DownloadUpdateResult = {
+    path: string;
+    fileName: string;
+    sizeBytes: number;
+  };
+
+  type UpdateRuntimeInfo = {
+    currentExePath: string;
+    stableEntryPath: string;
+    stableEntryExists: boolean;
+    isStableEntry: boolean;
+  };
+
+  type InstallStableEntryResult = {
+    stableEntryPath: string;
+    installed: boolean;
+  };
+
+  type InstallDownloadedUpdateResult = {
+    updaterScriptPath: string;
+    stableEntryPath: string;
+  };
+
+  type Metrics = {
+    totalTokens: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    nonCachedInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+    tokenEventCount: number;
+    projectCount: number;
+    sessionCount: number;
+    turnCount: number;
+    userMessageCount: number;
+    abnormalCount: number;
+    cacheRate: number;
+    dailyAverageTokens: number;
+    hourlyPeakTokens: number;
+  };
+
+  type DetailRow = {
+    rowKey: string;
+    parentKey: string | null;
+    hasChildren: boolean;
+    level: number;
+    kind: string;
+    node: string;
+    nodeTooltip: string;
+    startTime: string;
+    lastTime: string;
+    time: string;
+    project: string;
+    sessionId: string;
+    turnId: string;
+    event: string;
+    inputTokens: number;
+    cachedInputTokens: number;
+    nonCachedInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+    totalTokens: number;
+    status: string;
+    statusReason: string;
+  };
+
+  type SummaryRow = {
+    rowKey: string;
+    parentKey: string | null;
+    hasChildren: boolean;
+    level: number;
+    name: string;
+    project: string;
+    sessionId: string;
+    sessionCount: number;
+    messageCount: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+    totalTokens: number;
+    status: string;
+    statusReason: string;
+  };
+
+  type HourlyBucket = {
+    date: string;
+    hour: number;
+    totalTokens: number;
+    status: string;
+  };
+
+  type TrendBucket = {
+    label: string;
+    totalTokens: number;
+    status: string;
+  };
+
+  type Composition = {
+    name: string;
+    totalTokens: number;
+    ratio: number;
+    tone: string;
+  };
+
+  type TopSession = {
+    sessionId: string;
+    sessionName: string;
+    project: string;
+    projectName: string;
+    totalTokens: number;
+  };
+
+  type TopProject = {
+    project: string;
+    projectName: string;
+    totalTokens: number;
+  };
+
+  type FilterOption = {
+    value: string;
+    label: string;
+    title: string;
+    project?: string | null;
+  };
+
+  type DetailLevelControl = {
+    level: number;
+    icon: string;
+    label: string;
+    english: string;
+  };
+
+  type TooltipState = {
+    visible: boolean;
+    text: string;
+    x: number;
+    y: number;
+    placement: "above" | "below";
+  };
+
+  type ViewSnapshot = {
+    expandedDetailRows: string[];
+    detailExpandLevel: number | null;
+    windowScrollX: number;
+    windowScrollY: number;
+    detailScrollLeft: number;
+    detailScrollTop: number;
+  };
+
+  type HourlyDay = {
+    date: string;
+    inRange: boolean;
+  };
+
+  type DailyTrendBucket = TrendBucket & {
+    inRange: boolean;
+    displayLabel: string;
+  };
+
+  type CalendarDay = {
+    value: string;
+    label: number;
+    inCurrentMonth: boolean;
+    isToday: boolean;
+    isStart: boolean;
+    isEnd: boolean;
+    inRange: boolean;
+  };
+
+  type CalendarMonth = {
+    label: string;
+    days: CalendarDay[];
+  };
+
+  type DashboardData = {
+    generatedAt: string;
+    dataDir: string;
+    databasePath: string;
+    sessionsRoot: string;
+    config: AppConfig;
+    scanState: ScanState;
+    metrics: Metrics;
+    detailRows: DetailRow[];
+    summaryRows: SummaryRow[];
+    dailyBuckets: TrendBucket[];
+    monthlyBuckets: TrendBucket[];
+    hourlyBuckets: HourlyBucket[];
+    composition: Composition[];
+    topSessions: TopSession[];
+    topProjects: TopProject[];
+    projectOptions: FilterOption[];
+    sessionOptions: FilterOption[];
+  };
+
+  function todayLocalDate(): string {
+    const today = new Date();
+    const month = `${today.getMonth() + 1}`.padStart(2, "0");
+    const day = `${today.getDate()}`.padStart(2, "0");
+    return `${today.getFullYear()}-${month}-${day}`;
+  }
+
+  function defaultFilters(): UsageFilters {
+    const today = parseDateValue(todayLocalDate()) ?? new Date();
+    return {
+      dateFrom: formatDateValue(addDays(today, -13)),
+      dateTo: formatDateValue(today),
+      project: "",
+      session: "",
+      search: "",
+      onlyAnomalies: false
+    };
+  }
+
+  let activePage: Page = "stats";
+  let filters: UsageFilters = defaultFilters();
+  let appliedFilters: UsageFilters = { ...filters };
+  let draftDateFrom = filters.dateFrom;
+  let draftDateTo = filters.dateTo;
+  let settings: AppConfig = {
+    sessionsRoot: "",
+    includeArchived: true,
+    refreshIntervalSeconds: 0,
+    includeMessagesInExport: false,
+    retentionDays: 0,
+    updateSource: "DonaldL81/codex-token-usage"
+  };
+  let data: DashboardData | null = null;
+  let loading = false;
+  let error = "";
+  let showDateRangePicker = false;
+  let calendarBaseMonth = startOfMonth(parseDateValue(defaultFilters().dateFrom) ?? new Date());
+  let rangeAnchor: string | null = null;
+  let settingsMessage = "";
+  let updateInfo: UpdateInfo | null = null;
+  let updateRuntimeInfo: UpdateRuntimeInfo | null = null;
+  let updateButtonStatus: "idle" | "checking" | "latest" | "ready" | "downloading" | "installing" | "failed" =
+    "idle";
+  let updateStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  let editingSessionsRoot = false;
+  let draftSessionsRoot = settings.sessionsRoot;
+  let editingRefreshInterval = false;
+  let draftRefreshIntervalSeconds = settings.refreshIntervalSeconds;
+  let autoUpdateChecked = false;
+  let exportMessage = "";
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let trayUnlisten: UnlistenFn | null = null;
+  let trayCheckUpdateUnlisten: UnlistenFn | null = null;
+  let stableEntryEnsured = false;
+  let expandedDetailRows = new Set<string>();
+  let detailExpandLevel: number | null = 0;
+  let showOnlyAnomalies = false;
+  let updatedDetailRows = new Set<string>();
+  let detailTableWrap: HTMLDivElement | null = null;
+  let tooltip: TooltipState = { visible: false, text: "", x: 0, y: 0, placement: "below" };
+  let tooltipHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const detailLevelControls: DetailLevelControl[] = [
+    { level: 0, icon: "P", label: "项目", english: "Project" },
+    { level: 1, icon: "S", label: "会话", english: "Session" },
+    { level: 2, icon: "I", label: "用户输入", english: "User Input" },
+    { level: 3, icon: "T", label: "轮次", english: "Turn" },
+    { level: 4, icon: "#", label: "Token记录", english: "TokenCount" }
+  ];
+  const metricSkeletonLabels = [
+    "当前筛选总 Token",
+    "输入 Token",
+    "缓存输入",
+    "非缓存输入",
+    "输出 Token",
+    "推理输出",
+    "TokenCount",
+    "异常行"
+  ];
+  const DEFAULT_UPDATE_SOURCE = "DonaldL81/codex-token-usage";
+
+  $: metrics = data?.metrics;
+  $: initialLoading = loading && !data;
+  $: filteredSessionOptions = filterSessionOptions(data?.sessionOptions ?? [], filters.project);
+  $: detailRows = showOnlyAnomalies
+    ? filterDetailRowsByStatus(data?.detailRows ?? [], "正常")
+    : data?.detailRows ?? [];
+  $: visibleDetailRows = visibleTreeRows(detailRows, expandedDetailRows);
+  $: dailyTrendBuckets = buildDailyTrendBuckets(appliedFilters, data?.dailyBuckets ?? []);
+  $: hourlyDays = buildHourlyDays(appliedFilters);
+  $: hourlyMap = buildHourlyMap(data?.hourlyBuckets ?? []);
+  $: hourlyPeak = Math.max(...(data?.hourlyBuckets ?? []).map((bucket) => bucket.totalTokens), 0);
+  $: dailyPeak = Math.max(...dailyTrendBuckets.map((bucket) => bucket.totalTokens), 0);
+  $: monthlyPeak = Math.max(...(data?.monthlyBuckets ?? []).map((bucket) => bucket.totalTokens), 0);
+  $: topProjectPeak = Math.max(...(data?.topProjects ?? []).map((project) => project.totalTokens), 0);
+  $: topSessionPeak = Math.max(...(data?.topSessions ?? []).map((session) => session.totalTokens), 0);
+  $: calendarMonths = [
+    buildCalendarMonth(calendarBaseMonth, draftDateFrom, draftDateTo),
+    buildCalendarMonth(addMonths(calendarBaseMonth, 1), draftDateFrom, draftDateTo)
+  ];
+
+  function normalizeConfig(config: AppConfig): AppConfig {
+    return {
+      ...config,
+      includeArchived: true,
+      includeMessagesInExport: false,
+      updateSource: DEFAULT_UPDATE_SOURCE
+    };
+  }
+
+  function syncSettingsDrafts(nextSettings = settings) {
+    if (!editingSessionsRoot) {
+      draftSessionsRoot = nextSettings.sessionsRoot;
+    }
+    if (!editingRefreshInterval) {
+      draftRefreshIntervalSeconds = nextSettings.refreshIntervalSeconds;
+    }
+  }
+
+  onMount(() => {
+    restoreUiState();
+    refreshUsage();
+    listen("tray-refresh", () => refreshUsage())
+      .then((unlisten) => {
+        trayUnlisten = unlisten;
+      })
+      .catch(() => {
+        trayUnlisten = null;
+      });
+    listen("tray-check-update", () => checkUpdate())
+      .then((unlisten) => {
+        trayCheckUpdateUnlisten = unlisten;
+      })
+      .catch(() => {
+        trayCheckUpdateUnlisten = null;
+      });
+  });
+
+  onDestroy(() => {
+    clearRefreshTimer();
+    if (trayUnlisten) {
+      trayUnlisten();
+    }
+    if (trayCheckUpdateUnlisten) {
+      trayCheckUpdateUnlisten();
+    }
+    if (updateStatusTimer) {
+      clearTimeout(updateStatusTimer);
+    }
+    cancelTooltipHide();
+  });
+
+  async function refreshUsage() {
+    await loadDashboard("refresh_usage", { preserveView: true, filters: appliedFilters });
+  }
+
+  async function applyFilters() {
+    normalizeDateRange();
+    showDateRangePicker = false;
+    await loadDashboard("query_usage", { preserveView: false, filters });
+  }
+
+  async function autoApplyFilters(nextFilters: UsageFilters) {
+    filters = nextFilters;
+    normalizeDateRange();
+    syncDateRangeDraft();
+    showDateRangePicker = false;
+    await loadDashboard("query_usage", {
+      preserveView: false,
+      filters: { ...filters, search: appliedFilters.search }
+    });
+  }
+
+  async function loadDashboard(
+    command: "refresh_usage" | "query_usage",
+    options: { preserveView: boolean; filters: UsageFilters }
+  ) {
+    loading = true;
+    error = "";
+    const snapshot = options.preserveView ? captureViewSnapshot() : null;
+    const requestFilters = { ...options.filters, onlyAnomalies: false };
+    try {
+      const nextData = await invoke<DashboardData>(command, {
+        filters: requestFilters
+      });
+      updatedDetailRows =
+        command === "refresh_usage" && data
+          ? changedDetailRows(data.detailRows, nextData.detailRows)
+          : new Set();
+      data = nextData;
+      appliedFilters = requestFilters;
+      if (snapshot) {
+        await restoreViewSnapshot(snapshot, nextData);
+      } else {
+        expandedDetailRows = new Set();
+        detailExpandLevel = 0;
+      }
+      settings = normalizeConfig(nextData.config);
+      syncSettingsDrafts(settings);
+      setupRefreshTimer(settings.refreshIntervalSeconds);
+      maybeAutoCheckUpdate();
+      ensureStableEntry();
+      saveUiState();
+    } catch (unknownError) {
+      error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+    } finally {
+      loading = false;
+    }
+  }
+
+  function captureViewSnapshot(): ViewSnapshot {
+    return {
+      expandedDetailRows: [...expandedDetailRows],
+      detailExpandLevel,
+      windowScrollX: window.scrollX,
+      windowScrollY: window.scrollY,
+      detailScrollLeft: detailTableWrap?.scrollLeft ?? 0,
+      detailScrollTop: detailTableWrap?.scrollTop ?? 0
+    };
+  }
+
+  async function restoreViewSnapshot(snapshot: ViewSnapshot, nextData: DashboardData) {
+    if (snapshot.detailExpandLevel === null) {
+      expandedDetailRows = filterExistingKeys(snapshot.expandedDetailRows, nextData.detailRows);
+    } else {
+      expandedDetailRows = new Set(
+        nextData.detailRows
+          .filter((row) => row.hasChildren && row.level < snapshot.detailExpandLevel!)
+          .map((row) => row.rowKey)
+      );
+    }
+    detailExpandLevel = snapshot.detailExpandLevel;
+    await tick();
+    if (detailTableWrap) {
+      detailTableWrap.scrollLeft = snapshot.detailScrollLeft;
+      detailTableWrap.scrollTop = snapshot.detailScrollTop;
+    }
+    window.scrollTo(snapshot.windowScrollX, snapshot.windowScrollY);
+  }
+
+  function filterExistingKeys<T extends { rowKey: string }>(keys: string[], rows: T[]): Set<string> {
+    const existing = new Set(rows.map((row) => row.rowKey));
+    return new Set(keys.filter((key) => existing.has(key)));
+  }
+
+  function changedDetailRows(previousRows: DetailRow[], nextRows: DetailRow[]): Set<string> {
+    const previousSignatures = new Map(previousRows.map((row) => [row.rowKey, detailRowSignature(row)]));
+    return new Set(
+      nextRows
+        .filter((row) => previousSignatures.get(row.rowKey) !== detailRowSignature(row))
+        .map((row) => row.rowKey)
+    );
+  }
+
+  function detailRowSignature(row: DetailRow): string {
+    return [
+      row.parentKey ?? "",
+      row.hasChildren,
+      row.level,
+      row.kind,
+      row.node,
+      row.startTime,
+      row.lastTime,
+      row.inputTokens,
+      row.cachedInputTokens,
+      row.nonCachedInputTokens,
+      row.outputTokens,
+      row.reasoningOutputTokens,
+      row.totalTokens,
+      row.status,
+      row.statusReason
+    ].join("|");
+  }
+
+  function resetFilters() {
+    filters = defaultFilters();
+    syncDateRangeDraft();
+    showOnlyAnomalies = false;
+    showDateRangePicker = false;
+    applyFilters();
+  }
+
+  function visibleTreeRows<T extends { rowKey: string; parentKey: string | null }>(
+    rows: T[],
+    expandedRows: Set<string>
+  ): T[] {
+    const byKey = new Map(rows.map((row) => [row.rowKey, row]));
+    return rows.filter((row) => {
+      let parentKey = row.parentKey;
+      while (parentKey) {
+        if (!expandedRows.has(parentKey)) return false;
+        parentKey = byKey.get(parentKey)?.parentKey ?? null;
+      }
+      return true;
+    });
+  }
+
+  function filterDetailRowsByStatus(rows: DetailRow[], normalStatus: string): DetailRow[] {
+    const byKey = new Map(rows.map((row) => [row.rowKey, row]));
+    const keepKeys = new Set<string>();
+    rows
+      .filter((row) => row.status !== normalStatus)
+      .forEach((row) => {
+        keepKeys.add(row.rowKey);
+        let parentKey = row.parentKey;
+        while (parentKey) {
+          keepKeys.add(parentKey);
+          parentKey = byKey.get(parentKey)?.parentKey ?? null;
+        }
+      });
+    return rows.filter((row) => keepKeys.has(row.rowKey));
+  }
+
+  function filterSessionOptions(options: FilterOption[], selectedProject: string): FilterOption[] {
+    if (!selectedProject) return options;
+    return options.filter((option) => option.project === selectedProject);
+  }
+
+  function sessionOptionExists(options: FilterOption[], value: string): boolean {
+    return options.some((option) => option.value === value);
+  }
+
+  async function handleProjectSelect(event: Event) {
+    const project = (event.currentTarget as HTMLSelectElement).value;
+    const sessionsForProject = filterSessionOptions(data?.sessionOptions ?? [], project);
+    await autoApplyFilters({
+      ...filters,
+      project,
+      session: filters.session && sessionOptionExists(sessionsForProject, filters.session) ? filters.session : ""
+    });
+  }
+
+  async function handleSessionSelect(event: Event) {
+    await autoApplyFilters({
+      ...filters,
+      session: (event.currentTarget as HTMLSelectElement).value
+    });
+  }
+
+  function toggleDetailRow(rowKey: string) {
+    const next = new Set(expandedDetailRows);
+    if (next.has(rowKey)) {
+      next.delete(rowKey);
+    } else {
+      next.add(rowKey);
+    }
+    expandedDetailRows = next;
+    detailExpandLevel = null;
+  }
+
+  function expandDetailToLevel(level: number) {
+    const keys = detailRows
+      .filter((row) => row.hasChildren && row.level < level)
+      .map((row) => row.rowKey);
+    expandedDetailRows = new Set(keys);
+    detailExpandLevel = level;
+  }
+
+  function toggleOnlyAnomalies() {
+    const nextShowOnlyAnomalies = !showOnlyAnomalies;
+    showOnlyAnomalies = nextShowOnlyAnomalies;
+    if (detailExpandLevel !== null) {
+      const sourceRows = nextShowOnlyAnomalies
+        ? filterDetailRowsByStatus(data?.detailRows ?? [], "正常")
+        : data?.detailRows ?? [];
+      const keys = sourceRows
+        .filter((row) => row.hasChildren && row.level < detailExpandLevel!)
+        .map((row) => row.rowKey);
+      expandedDetailRows = new Set(keys);
+    }
+  }
+
+  function setPage(page: Page) {
+    activePage = page;
+    saveUiState();
+  }
+
+  function toggleDateRangePicker() {
+    showDateRangePicker = !showDateRangePicker;
+    if (showDateRangePicker) {
+      syncDateRangeDraft();
+      syncCalendarBase();
+      rangeAnchor = null;
+    }
+  }
+
+  async function setRecentRange(days: number) {
+    const today = parseDateValue(todayLocalDate()) ?? new Date();
+    draftDateFrom = formatDateValue(addDays(today, -(days - 1)));
+    draftDateTo = formatDateValue(today);
+    syncCalendarBase();
+    rangeAnchor = null;
+    await autoApplyFilters({ ...filters, dateFrom: draftDateFrom, dateTo: draftDateTo });
+  }
+
+  function startEditSessionsRoot() {
+    draftSessionsRoot = settings.sessionsRoot;
+    editingSessionsRoot = true;
+  }
+
+  function cancelEditSessionsRoot() {
+    draftSessionsRoot = settings.sessionsRoot;
+    editingSessionsRoot = false;
+  }
+
+  function startEditRefreshInterval() {
+    draftRefreshIntervalSeconds = settings.refreshIntervalSeconds;
+    editingRefreshInterval = true;
+  }
+
+  function cancelEditRefreshInterval() {
+    draftRefreshIntervalSeconds = settings.refreshIntervalSeconds;
+    editingRefreshInterval = false;
+  }
+
+  async function saveAppConfig(nextConfig: AppConfig, options: { refreshAfter: boolean }) {
+    settingsMessage = "";
+    exportMessage = "";
+    error = "";
+    try {
+      settings = normalizeConfig(
+        await invoke<AppConfig>("save_settings", {
+          config: normalizeConfig(nextConfig)
+        })
+      );
+      syncSettingsDrafts(settings);
+      setupRefreshTimer(settings.refreshIntervalSeconds);
+      settingsMessage = "设置已保存";
+      if (options.refreshAfter) {
+        await refreshUsage();
+      }
+    } catch (unknownError) {
+      error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+    }
+  }
+
+  async function saveSessionsRoot() {
+    const nextSessionsRoot = draftSessionsRoot.trim();
+    if (!nextSessionsRoot) return;
+    editingSessionsRoot = false;
+    await saveAppConfig({ ...settings, sessionsRoot: nextSessionsRoot }, { refreshAfter: true });
+  }
+
+  async function saveRefreshInterval() {
+    const nextInterval = Math.max(0, Number(draftRefreshIntervalSeconds) || 0);
+    draftRefreshIntervalSeconds = nextInterval;
+    editingRefreshInterval = false;
+    await saveAppConfig({ ...settings, refreshIntervalSeconds: nextInterval }, { refreshAfter: false });
+  }
+
+  async function checkUpdate() {
+    if (updateButtonStatus === "checking" || updateButtonStatus === "downloading" || updateButtonStatus === "installing") {
+      return;
+    }
+    setUpdateButtonStatus("checking");
+    error = "";
+    try {
+      updateInfo = await invoke<UpdateInfo>("check_update", { source: DEFAULT_UPDATE_SOURCE });
+      if (updateInfo.hasUpdate && updateInfo.downloadUrl) {
+        setUpdateButtonStatus("ready");
+      } else if (updateInfo.hasUpdate) {
+        setTemporaryUpdateStatus("failed");
+      } else {
+        setTemporaryUpdateStatus("latest");
+      }
+    } catch {
+      updateInfo = null;
+      setTemporaryUpdateStatus("failed");
+    }
+  }
+
+  async function installAvailableUpdate() {
+    if (!updateInfo?.downloadUrl) return;
+    setUpdateButtonStatus("downloading");
+    error = "";
+    try {
+      const result = await invoke<DownloadUpdateResult>("download_update_package", {
+        input: {
+          downloadUrl: updateInfo.downloadUrl,
+          version: updateInfo.latestVersion
+        }
+      });
+      setUpdateButtonStatus("installing");
+      await invoke<InstallDownloadedUpdateResult>("install_downloaded_update", {
+        input: { packagePath: result.path }
+      });
+    } catch {
+      setTemporaryUpdateStatus("failed");
+    }
+  }
+
+  async function loadUpdateRuntimeInfo() {
+    try {
+      updateRuntimeInfo = await invoke<UpdateRuntimeInfo>("get_update_runtime_info");
+    } catch {
+      updateRuntimeInfo = null;
+    }
+  }
+
+  async function ensureStableEntry() {
+    if (stableEntryEnsured) return;
+    stableEntryEnsured = true;
+    if (import.meta.env.DEV) {
+      await loadUpdateRuntimeInfo();
+      return;
+    }
+    try {
+      await invoke<InstallStableEntryResult>("install_stable_entry");
+      await loadUpdateRuntimeInfo();
+    } catch {
+      await loadUpdateRuntimeInfo();
+    }
+  }
+
+  function maybeAutoCheckUpdate() {
+    if (autoUpdateChecked) return;
+    const key = "codex-token-usage-last-update-check";
+    const lastChecked = Number(localStorage.getItem(key) ?? "0");
+    const twelveHours = 12 * 60 * 60 * 1000;
+    if (Number.isFinite(lastChecked) && Date.now() - lastChecked < twelveHours) return;
+    autoUpdateChecked = true;
+    localStorage.setItem(key, String(Date.now()));
+    checkUpdate();
+  }
+
+  function setUpdateButtonStatus(status: typeof updateButtonStatus) {
+    if (updateStatusTimer) {
+      clearTimeout(updateStatusTimer);
+      updateStatusTimer = null;
+    }
+    updateButtonStatus = status;
+  }
+
+  function setTemporaryUpdateStatus(status: "latest" | "failed") {
+    setUpdateButtonStatus(status);
+    updateStatusTimer = setTimeout(() => {
+      if (updateButtonStatus === status) {
+        updateButtonStatus = "idle";
+      }
+      updateStatusTimer = null;
+    }, 2500);
+  }
+
+  function updateButtonLabel(): string {
+    const labels: Record<typeof updateButtonStatus, string> = {
+      idle: "检查更新",
+      checking: "检查中",
+      latest: "已是最新",
+      ready: "立即更新",
+      downloading: "下载中",
+      installing: "安装中",
+      failed: "更新失败"
+    };
+    return labels[updateButtonStatus];
+  }
+
+  function updateButtonDisabled(): boolean {
+    return loading || updateButtonStatus === "checking" || updateButtonStatus === "downloading" || updateButtonStatus === "installing";
+  }
+
+  async function handleUpdateButton() {
+    if (updateButtonStatus === "ready") {
+      await installAvailableUpdate();
+      return;
+    }
+    await checkUpdate();
+  }
+
+  async function exportDetail() {
+    await exportCsv("export_detail_csv");
+  }
+
+  async function exportCsv(command: "export_detail_csv") {
+    exportMessage = "";
+    settingsMessage = "";
+    error = "";
+    try {
+      const result = await invoke<ExportResult>(command, { filters: appliedFilters });
+      exportMessage = `已导出 ${formatCount(result.rowCount)} 行：${result.path}`;
+    } catch (unknownError) {
+      error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+    }
+  }
+
+  async function rebuildLedger() {
+    if (!confirm("重建只会清空本工具的本地数据库，并会先备份 SQLite 文件；不会删除 Codex 原始日志。确认继续？")) {
+      return;
+    }
+    settingsMessage = "";
+    exportMessage = "";
+    error = "";
+    try {
+      const result = await invoke<RebuildResult>("rebuild_ledger");
+      settingsMessage = result.backupPath ? `数据库已重建，备份：${result.backupPath}` : "数据库已重建";
+      data = data ? { ...data, scanState: result.scanState } : data;
+      await refreshUsage();
+    } catch (unknownError) {
+      error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+    }
+  }
+
+  function setupRefreshTimer(seconds: number) {
+    clearRefreshTimer();
+    if (seconds > 0) {
+      refreshTimer = setInterval(() => {
+        refreshUsage();
+      }, seconds * 1000);
+    }
+  }
+
+  function clearRefreshTimer() {
+    if (refreshTimer) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
+  function restoreUiState() {
+    try {
+      localStorage.removeItem("codex-token-usage-filters");
+      filters = defaultFilters();
+      appliedFilters = { ...filters };
+    } catch {
+      filters = defaultFilters();
+      appliedFilters = { ...filters };
+    }
+  }
+
+  function saveUiState() {
+    try {
+      localStorage.removeItem("codex-token-usage-filters");
+    } catch {
+      // ignore storage failures
+    }
+  }
+
+  function formatToken(value: number): string {
+    if (!Number.isFinite(value)) return "0";
+    if (value < 10000) return Math.round(value).toString();
+    if (value >= 100000000) return `${trimUnit(value / 100000000, 2)}亿`;
+    return `${trimUnit(value / 10000, 2)}万`;
+  }
+
+  function trimUnit(value: number, decimals: number): string {
+    return value
+      .toFixed(decimals)
+      .replace(/\.0+$/, "")
+      .replace(/(\.\d*?)0+$/, "$1");
+  }
+
+  function formatCount(value: number): string {
+    return new Intl.NumberFormat("zh-CN").format(value);
+  }
+
+  function statusClass(status: string): string {
+    if (status === "异常") return "status-bad";
+    if (status === "偏高") return "status-warn";
+    return "status-ok";
+  }
+
+  function levelLabel(level: number): string {
+    return ["P", "S", "I", "T", "#"][level] ?? "-";
+  }
+
+  function detailKindLabel(kind: string): string {
+    const labels: Record<string, string> = {
+      Project: "项目",
+      Session: "会话",
+      UserInput: "用户输入",
+      Turn: "轮次",
+      TokenCount: "Token记录"
+    };
+    return labels[kind] ?? kind;
+  }
+
+  function detailNodeText(row: DetailRow): string {
+    if (row.kind === "UserInput") return row.node.replace(/^用户输入\s*/, "");
+    if (row.kind === "Turn") return row.node.replace(/^Turn\s*/, "");
+    if (row.kind === "TokenCount") return row.node.replace(/^TokenCount\s*/, "");
+    return row.node;
+  }
+
+  function showTooltip(event: MouseEvent | FocusEvent, text: string) {
+    cancelTooltipHide();
+    const value = text.trim();
+    if (!value) return;
+    const target = event.currentTarget as HTMLElement;
+    const rect = target.getBoundingClientRect();
+    const width = Math.min(760, window.innerWidth - 24);
+    const x = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+    const maxTooltipHeight = Math.min(386, window.innerHeight - 24);
+    const spaceBelow = window.innerHeight - rect.bottom - 12;
+    const spaceAbove = rect.top - 12;
+    const shouldShowAbove = spaceBelow < maxTooltipHeight && spaceAbove > spaceBelow;
+    tooltip = {
+      visible: true,
+      text: value,
+      x,
+      y: shouldShowAbove ? rect.top - 8 : rect.bottom + 8,
+      placement: shouldShowAbove ? "above" : "below"
+    };
+  }
+
+  function cancelTooltipHide() {
+    if (tooltipHideTimer) {
+      clearTimeout(tooltipHideTimer);
+      tooltipHideTimer = null;
+    }
+  }
+
+  function scheduleHideTooltip() {
+    cancelTooltipHide();
+    tooltipHideTimer = setTimeout(() => {
+      hideTooltip();
+    }, 120);
+  }
+
+  function hideTooltip() {
+    cancelTooltipHide();
+    tooltip = { ...tooltip, visible: false };
+  }
+
+  function buildHourlyDays(currentFilters: UsageFilters): HourlyDay[] {
+    return buildRecentWindowDays(currentFilters, 14);
+  }
+
+  function buildHourlyMap(buckets: HourlyBucket[]): Map<string, HourlyBucket> {
+    return new Map(buckets.map((bucket) => [`${bucket.date}|${bucket.hour}`, bucket]));
+  }
+
+  function buildRecentWindowDays(currentFilters: UsageFilters, windowDays: number): HourlyDay[] {
+    const endDate = parseDateValue(currentFilters.dateTo) ?? parseDateValue(todayLocalDate()) ?? new Date();
+    return Array.from({ length: windowDays }, (_, index) => {
+      const date = formatDateValue(addDays(endDate, index - (windowDays - 1)));
+      return {
+        date,
+        inRange: dateWithinFilters(date, currentFilters)
+      };
+    });
+  }
+
+  function buildDailyTrendBuckets(currentFilters: UsageFilters, buckets: TrendBucket[]): DailyTrendBucket[] {
+    const byDate = new Map(buckets.map((bucket) => [bucket.label, bucket]));
+    return buildRecentWindowDays(currentFilters, 14).map((day) => {
+      const bucket = day.inRange ? byDate.get(day.date) : undefined;
+      return {
+        ...(bucket ?? {
+          label: day.date,
+          totalTokens: 0,
+          status: "正常"
+        }),
+        label: day.date,
+        inRange: day.inRange,
+        displayLabel: day.inRange ? shortDateLabel(day.date) : "-"
+      };
+    });
+  }
+
+  function dateWithinFilters(date: string, currentFilters: UsageFilters): boolean {
+    const from = currentFilters.dateFrom || "0000-00-00";
+    const to = currentFilters.dateTo || "9999-99-99";
+    return date >= from && date <= to;
+  }
+
+  function bucketClass(bucket: HourlyBucket | undefined): string {
+    if (!bucket || bucket.totalTokens <= 0) return "heat-cell empty";
+    if (bucket.status === "异常") return "heat-cell abnormal";
+    const ratio = hourlyPeak <= 0 ? 0 : bucket.totalTokens / hourlyPeak;
+    if (ratio >= 0.66) return "heat-cell high";
+    if (ratio >= 0.33) return "heat-cell medium";
+    return "heat-cell low";
+  }
+
+  function hasTrendData(bucket: TrendBucket): boolean {
+    return bucket.totalTokens > 0;
+  }
+
+  function trendValueText(bucket: TrendBucket): string {
+    return hasTrendData(bucket) ? formatToken(bucket.totalTokens) : "-";
+  }
+
+  function trendHeight(bucket: TrendBucket, peak: number): string {
+    if (peak <= 0 || !hasTrendData(bucket)) return "0%";
+    return `${Math.max((bucket.totalTokens / peak) * 100, 2)}%`;
+  }
+
+  function barWidth(value: number, peak: number): string {
+    if (peak <= 0) return "0%";
+    return `${Math.max((value / peak) * 100, 2)}%`;
+  }
+
+  function valueToneClass(value: number, peak: number): string {
+    if (peak <= 0 || value <= 0) return "tone-low";
+    const ratio = value / peak;
+    if (ratio >= 0.85) return "tone-abnormal";
+    if (ratio >= 0.6) return "tone-high";
+    if (ratio >= 0.25) return "tone-medium";
+    return "tone-low";
+  }
+
+  function trendClass(bucket: TrendBucket): string {
+    if (!hasTrendData(bucket)) return "";
+    if (bucket.status === "异常") return "bad";
+    if (bucket.status === "偏高") return "warn";
+    return "ok";
+  }
+
+  function dayLabel(date: string): string {
+    return shortDateLabel(date);
+  }
+
+  function shortDateLabel(date: string): string {
+    return date.slice(5).replace("-", "/");
+  }
+
+  function formatDisplayDate(date: string): string {
+    return date.replaceAll("-", "/");
+  }
+
+  function dateRangeText(dateFrom: string, dateTo: string): string {
+    return `${formatDisplayDate(dateFrom)} 至 ${formatDisplayDate(dateTo)}`;
+  }
+
+  function buildCalendarMonth(monthDate: Date, selectedFrom: string, selectedTo: string): CalendarMonth {
+    const monthStart = startOfMonth(monthDate);
+    const weekOffset = (monthStart.getDay() + 6) % 7;
+    const gridStart = addDays(monthStart, -weekOffset);
+    const currentMonth = monthStart.getMonth();
+    const today = todayLocalDate();
+    return {
+      label: `${monthStart.getFullYear()}年 ${monthStart.getMonth() + 1}月`,
+      days: Array.from({ length: 42 }, (_, index) => {
+        const date = addDays(gridStart, index);
+        const value = formatDateValue(date);
+        return {
+          value,
+          label: date.getDate(),
+          inCurrentMonth: date.getMonth() === currentMonth,
+          isToday: value === today,
+          isStart: date.getMonth() === currentMonth && value === selectedFrom,
+          isEnd: date.getMonth() === currentMonth && value === selectedTo,
+          inRange: date.getMonth() === currentMonth && value > selectedFrom && value < selectedTo
+        };
+      })
+    };
+  }
+
+  function calendarDayClass(day: CalendarDay): string {
+    return [
+      "calendar-day",
+      day.inCurrentMonth ? "" : "muted",
+      day.inRange ? "in-range" : "",
+      day.isStart ? "range-start" : "",
+      day.isEnd ? "range-end" : "",
+      day.isToday ? "today" : ""
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function selectRangeDate(value: string) {
+    if (!rangeAnchor) {
+      draftDateFrom = value;
+      draftDateTo = value;
+      rangeAnchor = value;
+      return;
+    }
+    if (value < rangeAnchor) {
+      draftDateFrom = value;
+      draftDateTo = rangeAnchor;
+    } else {
+      draftDateFrom = rangeAnchor;
+      draftDateTo = value;
+    }
+    rangeAnchor = null;
+  }
+
+  function moveCalendar(months: number) {
+    calendarBaseMonth = addMonths(calendarBaseMonth, months);
+  }
+
+  function syncCalendarBase() {
+    calendarBaseMonth = startOfMonth(parseDateValue(draftDateFrom) ?? new Date());
+  }
+
+  function syncDateRangeDraft() {
+    draftDateFrom = filters.dateFrom;
+    draftDateTo = filters.dateTo;
+  }
+
+  async function confirmDateRange() {
+    rangeAnchor = null;
+    await autoApplyFilters({ ...filters, dateFrom: draftDateFrom, dateTo: draftDateTo });
+  }
+
+  function formatDetailStartTime(row: DetailRow): string {
+    if (row.kind === "TokenCount") return "";
+    return formatLocalMinute(row.startTime || row.time);
+  }
+
+  function formatDetailLastTime(row: DetailRow): string {
+    return formatLocalMinute(row.lastTime || row.time);
+  }
+
+  function formatLocalMinute(value: string): string {
+    const cleanValue = value.trim().replace(/\s+[+-]\d{2}:\d{2}$/, "");
+    if (cleanValue.length < 16) return cleanValue.replaceAll("-", "/");
+    return cleanValue.slice(0, 16).replaceAll("-", "/");
+  }
+
+  function normalizeDateRange() {
+    const from = parseDateValue(filters.dateFrom);
+    const to = parseDateValue(filters.dateTo);
+    if (!from || !to || from <= to) return;
+    filters = {
+      ...filters,
+      dateFrom: formatDateValue(to),
+      dateTo: formatDateValue(from)
+    };
+  }
+
+  function parseDateValue(value: string): Date | null {
+    const parsed = new Date(`${value}T00:00:00`);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  function addDays(date: Date, days: number): Date {
+    const next = new Date(date);
+    next.setDate(next.getDate() + days);
+    return next;
+  }
+
+  function addMonths(date: Date, months: number): Date {
+    const next = new Date(date);
+    next.setMonth(next.getMonth() + months, 1);
+    return next;
+  }
+
+  function startOfMonth(date: Date): Date {
+    return new Date(date.getFullYear(), date.getMonth(), 1);
+  }
+
+  function formatDateValue(date: Date): string {
+    const month = `${date.getMonth() + 1}`.padStart(2, "0");
+    const day = `${date.getDate()}`.padStart(2, "0");
+    return `${date.getFullYear()}-${month}-${day}`;
+  }
+
+  function percentOf(value: number, total: number): string {
+    if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) return "0%";
+    return `${trimUnit((value / total) * 100, 1)}%`;
+  }
+
+  function ringSegmentStyle(segments: Array<{ value: number; color: string }>, total: number): string {
+    if (total <= 0) return "conic-gradient(#eef3f9 0deg 360deg)";
+    let cursor = 0;
+    const parts = segments.map((segment) => {
+      const span = Math.max((segment.value / total) * 360, 0);
+      const start = cursor;
+      cursor += span;
+      return `${segment.color} ${start}deg ${cursor}deg`;
+    });
+    if (cursor < 360) {
+      parts.push(`#eef3f9 ${cursor}deg 360deg`);
+    }
+    return `conic-gradient(${parts.join(", ")})`;
+  }
+
+  function outputTotal(metricValues: Metrics): number {
+    return metricValues.outputTokens + metricValues.reasoningOutputTokens;
+  }
+
+  function totalRingStyle(metricValues: Metrics): string {
+    return ringSegmentStyle(
+      [
+        { value: metricValues.inputTokens, color: "var(--data-blue)" },
+        { value: outputTotal(metricValues), color: "var(--data-green)" }
+      ],
+      metricValues.totalTokens
+    );
+  }
+
+  function inputRingStyle(metricValues: Metrics): string {
+    return ringSegmentStyle(
+      [
+        { value: metricValues.cachedInputTokens, color: "var(--data-green)" },
+        { value: metricValues.nonCachedInputTokens, color: "var(--data-orange)" }
+      ],
+      metricValues.inputTokens
+    );
+  }
+
+  function outputRingStyle(metricValues: Metrics): string {
+    return ringSegmentStyle(
+      [
+        { value: metricValues.outputTokens, color: "var(--data-blue)" },
+        { value: metricValues.reasoningOutputTokens, color: "var(--data-red)" }
+      ],
+      outputTotal(metricValues)
+    );
+  }
+
+  function timeText(value: string | null | undefined): string {
+    return value ? value.replace("T", " ").replace("Z", " UTC") : "-";
+  }
+</script>
+
+<main class="app-shell" on:contextmenu|preventDefault>
+  <header class="topbar">
+    <div>
+      <h1>Codex Token Usage</h1>
+      <p>本机日志实时统计与分层明细</p>
+    </div>
+    <div class="toolbar-controls topbar-controls">
+      <label class="toolbar-field session-root-field">
+        <span>会话目录</span>
+        <div class="toolbar-input-group">
+          <input
+            type="text"
+            bind:value={draftSessionsRoot}
+            readonly={!editingSessionsRoot}
+            title={draftSessionsRoot}
+          />
+          {#if editingSessionsRoot}
+            <button type="button" class="primary" on:click={saveSessionsRoot} disabled={loading || !draftSessionsRoot.trim()}>
+              保存
+            </button>
+            <button type="button" on:click={cancelEditSessionsRoot} disabled={loading}>取消</button>
+          {:else}
+            <button type="button" on:click={startEditSessionsRoot} disabled={loading}>编辑</button>
+          {/if}
+        </div>
+      </label>
+      <button class="danger" on:click={rebuildLedger} disabled={!data || loading}>重建数据库</button>
+      <label class="toolbar-field refresh-field">
+        <span>自动刷新(s)</span>
+        <div class="toolbar-input-group">
+          <input
+            type="number"
+            min="0"
+            step="30"
+            bind:value={draftRefreshIntervalSeconds}
+            readonly={!editingRefreshInterval}
+          />
+          {#if editingRefreshInterval}
+            <button type="button" class="primary" on:click={saveRefreshInterval} disabled={loading}>保存</button>
+            <button type="button" on:click={cancelEditRefreshInterval} disabled={loading}>取消</button>
+          {:else}
+            <button type="button" on:click={startEditRefreshInterval} disabled={loading}>编辑</button>
+          {/if}
+        </div>
+      </label>
+      <button
+        class:primary={updateButtonStatus === "ready" || updateButtonStatus === "installing"}
+        on:click={handleUpdateButton}
+        disabled={updateButtonDisabled()}
+      >
+        {updateButtonLabel()}
+      </button>
+      <button class="primary" on:click={refreshUsage} disabled={loading}>
+        {loading ? "刷新中" : "刷新"}
+      </button>
+    </div>
+  </header>
+
+  {#if error}
+    <section class="alert">{error}</section>
+  {/if}
+
+  {#if data?.scanState.error}
+    <section class="alert">{data.scanState.error}</section>
+  {/if}
+
+  {#if settingsMessage || exportMessage}
+    <section class="notice">{settingsMessage || exportMessage}</section>
+  {/if}
+
+  {#if metrics || initialLoading}
+    <section class="metric-grid" class:loading-skeleton={initialLoading}>
+      {#if metrics}
+        <article>
+          <span>当前筛选总 Token</span>
+          <strong class="blue">{formatToken(metrics.totalTokens)}</strong>
+        </article>
+        <article>
+          <span>输入 Token</span>
+          <strong class="blue">{formatToken(metrics.inputTokens)}</strong>
+        </article>
+        <article>
+          <span>缓存输入</span>
+          <strong class="green">{formatToken(metrics.cachedInputTokens)}</strong>
+        </article>
+        <article>
+          <span>非缓存输入</span>
+          <strong class="orange">{formatToken(metrics.nonCachedInputTokens)}</strong>
+        </article>
+        <article>
+          <span>输出 Token</span>
+          <strong class="blue">{formatToken(metrics.outputTokens)}</strong>
+        </article>
+        <article>
+          <span>推理输出</span>
+          <strong class="red">{formatToken(metrics.reasoningOutputTokens)}</strong>
+        </article>
+        <article>
+          <span>TokenCount</span>
+          <strong>{formatCount(metrics.tokenEventCount)}</strong>
+        </article>
+        <article>
+          <span>异常行</span>
+          <strong class="red">{formatCount(metrics.abnormalCount)}</strong>
+        </article>
+      {:else}
+        {#each metricSkeletonLabels as label}
+          <article>
+            <span>{label}</span>
+            <strong aria-hidden="true"></strong>
+          </article>
+        {/each}
+      {/if}
+    </section>
+  {/if}
+
+  <section class="view-toolbar">
+    <nav aria-label="页面">
+      <button class:active={activePage === "stats"} on:click={() => setPage("stats")}>
+        统计页
+      </button>
+      <button class:active={activePage === "detail"} on:click={() => setPage("detail")}>
+        明细页
+      </button>
+    </nav>
+    <section class="filters header-filters">
+      <div class="date-range-filter">
+        <span>日期范围</span>
+        <button type="button" class="date-range-button" on:click={toggleDateRangePicker}>
+          {showDateRangePicker
+            ? dateRangeText(draftDateFrom, draftDateTo)
+            : dateRangeText(filters.dateFrom, filters.dateTo)}
+        </button>
+        {#if showDateRangePicker}
+          <div class="date-range-popover">
+            <div class="range-shortcuts">
+              <button type="button" on:click={() => setRecentRange(7)}>最近一周</button>
+              <button type="button" on:click={() => setRecentRange(30)}>最近一个月</button>
+              <button type="button" on:click={() => setRecentRange(90)}>最近三个月</button>
+            </div>
+            <div class="range-calendar-toolbar">
+              <button type="button" aria-label="上一年" on:click={() => moveCalendar(-12)}>«</button>
+              <button type="button" aria-label="上一月" on:click={() => moveCalendar(-1)}>‹</button>
+              <span>{dateRangeText(draftDateFrom, draftDateTo)}</span>
+              <button type="button" aria-label="下一月" on:click={() => moveCalendar(1)}>›</button>
+              <button type="button" aria-label="下一年" on:click={() => moveCalendar(12)}>»</button>
+            </div>
+            <div class="range-calendars">
+              {#each calendarMonths as month}
+                <section class="calendar-month">
+                  <h3>{month.label}</h3>
+                  <div class="calendar-weekdays">
+                    {#each ["一", "二", "三", "四", "五", "六", "日"] as weekday}
+                      <span>{weekday}</span>
+                    {/each}
+                  </div>
+                  <div class="calendar-days">
+                    {#each month.days as day}
+                      <button
+                        type="button"
+                        class={calendarDayClass(day)}
+                        on:click={() => selectRangeDate(day.value)}
+                        aria-label={day.value}
+                      >
+                        {day.label}
+                      </button>
+                    {/each}
+                  </div>
+                </section>
+              {/each}
+            </div>
+            <div class="range-actions">
+              <button
+                type="button"
+                class="primary"
+                on:click={confirmDateRange}
+              >
+                确定
+              </button>
+            </div>
+          </div>
+        {/if}
+      </div>
+      <label>
+        <span>项目</span>
+        <select value={filters.project} on:change={handleProjectSelect}>
+          <option value="">全部项目</option>
+          {#each data?.projectOptions ?? [] as project}
+            <option value={project.value} title={project.title}>{project.label}</option>
+          {/each}
+        </select>
+      </label>
+      <label>
+        <span>会话</span>
+        <select value={filters.session} on:change={handleSessionSelect}>
+          <option value="">全部会话</option>
+          {#each filteredSessionOptions as session}
+            <option value={session.value} title={session.title}>{session.label}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="search">
+        <span>搜索</span>
+        <div class="search-control">
+          <input type="search" placeholder="项目名称 / 会话名称 / 输入内容" bind:value={filters.search} />
+          <button type="button" on:click={applyFilters} disabled={loading}>查询</button>
+        </div>
+      </label>
+      <button class="ghost" on:click={resetFilters} disabled={loading}>重置</button>
+    </section>
+  </section>
+
+  {#if activePage === "detail"}
+    <section class="panel">
+      <div class="panel-title detail-title">
+        <div class="detail-title-top">
+          <h2>Token用量明细</h2>
+        </div>
+        <div class="detail-controls-row">
+          <div class="level-legend">
+            {#each detailLevelControls as control}
+              <button
+                type="button"
+                class:active={detailExpandLevel === control.level}
+                on:click={() => expandDetailToLevel(control.level)}
+                disabled={!data}
+              >
+                <i class={`dot level-${control.level}`}>{control.icon}</i>
+                <strong>{control.label}</strong>
+                <span>{control.english}</span>
+              </button>
+            {/each}
+          </div>
+          <div class="detail-tools">
+            <span class="row-count">{formatCount(visibleDetailRows.length)} / {formatCount(data?.detailRows.length ?? 0)} 行</span>
+            <button
+              type="button"
+              class:active={showOnlyAnomalies}
+              on:click={toggleOnlyAnomalies}
+              disabled={!data}
+            >
+              仅异常
+            </button>
+            <button on:click={exportDetail} disabled={!data}>导出明细</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrap detail" bind:this={detailTableWrap}>
+        <table>
+          <colgroup>
+            <col class="col-node" />
+            <col class="col-start-time" />
+            <col class="col-last-time" />
+            <col class="col-status" />
+            <col class="col-token" />
+            <col class="col-token" />
+            <col class="col-token" />
+            <col class="col-token" />
+            <col class="col-token" />
+            <col class="col-token" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>层级 / 节点</th>
+              <th>开始时间</th>
+              <th>最后更新时间</th>
+              <th>状态</th>
+              <th>总计</th>
+              <th>输入</th>
+              <th>缓存输入</th>
+              <th>非缓存</th>
+              <th>输出</th>
+              <th>推理输出</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#if data && data.detailRows.length > 0}
+              {#each visibleDetailRows as row}
+              <tr>
+                <td class="node" style={`--indent:${row.level * 18}px`}>
+                  {#if row.hasChildren}
+                    <button
+                      class="tree-toggle"
+                      aria-label={expandedDetailRows.has(row.rowKey) ? "折叠" : "展开"}
+                      on:click={() => toggleDetailRow(row.rowKey)}
+                    >
+                      {expandedDetailRows.has(row.rowKey) ? "▾" : "▸"}
+                    </button>
+                  {:else}
+                    <span class="tree-spacer"></span>
+                  {/if}
+                  <span class={`dot level-${row.level}`}>{levelLabel(row.level)}</span>
+                    <button
+                      type="button"
+                      class="node-label node-tooltip-trigger"
+                      on:mouseenter={(event) => showTooltip(event, row.nodeTooltip)}
+                      on:mouseleave={scheduleHideTooltip}
+                      on:focus={(event) => showTooltip(event, row.nodeTooltip)}
+                      on:blur={scheduleHideTooltip}
+                    >
+                      <strong class="node-type">{detailKindLabel(row.kind)}：</strong>{detailNodeText(row)}
+                    </button>
+                  </td>
+                <td>{formatDetailStartTime(row)}</td>
+                <td>
+                  <span class="time-cell" class:updated={updatedDetailRows.has(row.rowKey)}>
+                    {formatDetailLastTime(row)}
+                  </span>
+                </td>
+                <td><span class={`status ${statusClass(row.status)}`} title={row.statusReason}>{row.status}</span></td>
+                <td class="total">{formatToken(row.totalTokens)}</td>
+                <td>{formatToken(row.inputTokens)}</td>
+                <td>{formatToken(row.cachedInputTokens)}</td>
+                <td>{formatToken(row.nonCachedInputTokens)}</td>
+                <td>{formatToken(row.outputTokens)}</td>
+                <td>{formatToken(row.reasoningOutputTokens)}</td>
+              </tr>
+              {/each}
+            {:else}
+              <tr>
+                <td class="empty-row" colspan="10">
+                  {loading ? "正在读取本机 Codex 日志..." : "当前筛选条件下没有明细记录"}
+                </td>
+              </tr>
+            {/if}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {:else}
+    <section class="stats-layout" class:initial-loading={initialLoading}>
+      <section class="trend-card month-trend-panel">
+        <h3>半年趋势</h3>
+        {#if data && data.monthlyBuckets.length > 0}
+          <div class="vertical-chart">
+            {#each data.monthlyBuckets as bucket}
+              <div class="chart-column" title={hasTrendData(bucket) ? `${bucket.label} ${formatToken(bucket.totalTokens)}` : `${bucket.label} 无数据`}>
+                <b>{trendValueText(bucket)}</b>
+                <div class="chart-track">
+                  <i class={trendClass(bucket)} style={`height:${trendHeight(bucket, monthlyPeak)}`}></i>
+                </div>
+                <span>{hasTrendData(bucket) ? bucket.label : "-"}</span>
+              </div>
+            {/each}
+          </div>
+        {:else if initialLoading}
+          <div class="vertical-chart skeleton-chart">
+            {#each Array.from({ length: 6 }) as _, index}
+              <div class="chart-column">
+                <b aria-hidden="true"></b>
+                <div class="chart-track">
+                  <i style={`height:${index >= 4 ? "82%" : "2%"}`}></i>
+                </div>
+                <span aria-hidden="true"></span>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="empty-block">暂无月趋势数据</div>
+        {/if}
+      </section>
+
+      <section class="trend-card daily-trend-panel">
+        <h3>近2周-趋势</h3>
+        {#if data}
+          <div class="vertical-chart daily-chart">
+            {#each dailyTrendBuckets as bucket}
+              <div class="chart-column" title={bucket.inRange && hasTrendData(bucket) ? `${bucket.label} ${formatToken(bucket.totalTokens)}` : "无数据"}>
+                <b>{bucket.inRange ? trendValueText(bucket) : "-"}</b>
+                <div class="chart-track">
+                  <i class={trendClass(bucket)} style={`height:${trendHeight(bucket, dailyPeak)}`}></i>
+                </div>
+                <span>{bucket.displayLabel}</span>
+              </div>
+            {/each}
+          </div>
+        {:else if initialLoading}
+          <div class="vertical-chart daily-chart skeleton-chart">
+            {#each Array.from({ length: 14 }) as _, index}
+              <div class="chart-column">
+                <b aria-hidden="true"></b>
+                <div class="chart-track">
+                  <i style={`height:${index < 8 ? "2%" : "64%"}`}></i>
+                </div>
+                <span aria-hidden="true"></span>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="empty-block">暂无日趋势数据</div>
+        {/if}
+      </section>
+
+      <section class="panel top-list-panel project-rank-panel">
+        <div class="panel-title compact">
+          <div>
+            <h2>项目排行</h2>
+          </div>
+        </div>
+        <div class="top-bars">
+          {#if data && data.topProjects.length > 0}
+            {#each data.topProjects as project}
+              <div class={`top-bar-row ${valueToneClass(project.totalTokens, topProjectPeak)}`}>
+                <span>{project.projectName}</span>
+                <div class="top-bar-track">
+                  <i style={`width:${barWidth(project.totalTokens, topProjectPeak)}`}></i>
+                </div>
+                <b>{formatToken(project.totalTokens)}</b>
+              </div>
+            {/each}
+          {:else if initialLoading}
+            {#each Array.from({ length: 6 }) as _, index}
+              <div class="top-bar-row skeleton-row">
+                <span aria-hidden="true"></span>
+                <div class="top-bar-track">
+                  <i style={`width:${index === 0 ? "100%" : `${Math.max(8, 54 - index * 8)}%`}`}></i>
+                </div>
+                <b aria-hidden="true"></b>
+              </div>
+            {/each}
+          {:else}
+            <div class="top-empty">暂无项目数据</div>
+          {/if}
+        </div>
+      </section>
+
+      <section class="panel composition-panel composition-rank-panel">
+        <div class="panel-title compact">
+          <div>
+            <h2>Token 构成</h2>
+          </div>
+        </div>
+        <div class="composition">
+          {#if metrics}
+            <div class="composition-rings">
+              <div class="composition-ring-item tone-medium">
+                <div class="single-ring" style={`--ring:${totalRingStyle(metrics)}`}>
+                  <div class="single-ring-center">
+                    <span>总计</span>
+                    <b>{formatToken(metrics.totalTokens)}</b>
+                  </div>
+                </div>
+                <div class="ring-legend">
+                  <div class="tone-medium"><i class="blue-bg"></i><span>输入：<b>{percentOf(metrics.inputTokens, metrics.totalTokens)}</b></span></div>
+                  <div class="tone-low"><i class="green-bg"></i><span>输出：<b>{percentOf(outputTotal(metrics), metrics.totalTokens)}</b></span></div>
+                </div>
+              </div>
+
+              <div class="composition-ring-item tone-low">
+                <div class="single-ring" style={`--ring:${inputRingStyle(metrics)}`}>
+                  <div class="single-ring-center">
+                    <span>输入</span>
+                    <b>{formatToken(metrics.inputTokens)}</b>
+                  </div>
+                </div>
+                <div class="ring-legend">
+                  <div class="tone-low"><i class="green-bg"></i><span>缓存输入：<b>{percentOf(metrics.cachedInputTokens, metrics.inputTokens)}</b></span></div>
+                  <div class="tone-high"><i class="orange-bg"></i><span>非缓存输入：<b>{percentOf(metrics.nonCachedInputTokens, metrics.inputTokens)}</b></span></div>
+                </div>
+              </div>
+
+              <div class="composition-ring-item tone-abnormal">
+                <div class="single-ring" style={`--ring:${outputRingStyle(metrics)}`}>
+                  <div class="single-ring-center">
+                    <span>输出</span>
+                    <b>{formatToken(outputTotal(metrics))}</b>
+                  </div>
+                </div>
+                <div class="ring-legend">
+                  <div class="tone-abnormal"><i class="red-bg"></i><span>推理输出：<b>{percentOf(metrics.reasoningOutputTokens, outputTotal(metrics))}</b></span></div>
+                  <div class="tone-medium"><i class="blue-bg"></i><span>非推理输出：<b>{percentOf(metrics.outputTokens, outputTotal(metrics))}</b></span></div>
+                </div>
+              </div>
+            </div>
+          {:else if initialLoading}
+            <div class="composition-rings composition-skeleton">
+              <div class="composition-ring-item">
+                <div class="single-ring" aria-hidden="true"></div>
+                <div class="ring-legend">
+                  <div><i></i><span></span></div>
+                  <div><i></i><span></span></div>
+                </div>
+              </div>
+              <div class="composition-ring-item">
+                <div class="single-ring" aria-hidden="true"></div>
+                <div class="ring-legend">
+                  <div><i></i><span></span></div>
+                  <div><i></i><span></span></div>
+                </div>
+              </div>
+              <div class="composition-ring-item">
+                <div class="single-ring" aria-hidden="true"></div>
+                <div class="ring-legend">
+                  <div><i></i><span></span></div>
+                  <div><i></i><span></span></div>
+                </div>
+              </div>
+            </div>
+          {:else}
+            <div class="empty-block">{loading ? "正在计算构成..." : "暂无构成数据"}</div>
+          {/if}
+        </div>
+      </section>
+
+      <section class="panel heat-panel hourly-rank-panel">
+        <div class="panel-title compact">
+          <div>
+            <h2>近2周-分时</h2>
+            <p>按每天 0-24 小时展示 token 用量，颜色越深表示消耗越高。</p>
+          </div>
+          <div class="legend">
+            <span class="low">低</span>
+            <span class="medium">中</span>
+            <span class="high">高</span>
+            <span class="abnormal">异常</span>
+          </div>
+        </div>
+        <div class="heatmap">
+            <div class="hour-labels">
+              {#each [0, 4, 8, 12, 16, 20, 24] as hour}
+              <span style={`top:${(hour / 24) * 100}%`}>{hour}点</span>
+            {/each}
+          </div>
+          <div
+            class={`day-grid${hourlyDays.length > 7 ? " compact" : ""}`}
+            style={`grid-template-columns: repeat(${Math.max(hourlyDays.length, 1)}, minmax(0, 1fr));`}
+          >
+            {#if hourlyDays.length > 0}
+              {#each hourlyDays as day}
+                <div class="day-column" class:outside-range={!day.inRange}>
+                  {#each Array.from({ length: 24 }, (_, index) => index) as hour}
+                    {@const bucket = day.inRange ? hourlyMap.get(`${day.date}|${hour}`) : undefined}
+                    <div
+                      class={bucketClass(bucket)}
+                      title={day.inRange ? `${day.date} ${hour}:00 ${formatToken(bucket?.totalTokens ?? 0)}` : ""}
+                    ></div>
+                  {/each}
+                  <span>{day.inRange ? dayLabel(day.date) : "-"}</span>
+                </div>
+              {/each}
+            {:else}
+              <div class="heat-empty">{loading ? "正在生成小时分布..." : "暂无小时数据"}</div>
+            {/if}
+          </div>
+        </div>
+      </section>
+
+      <section class="panel top-list-panel session-rank-panel">
+        <div class="panel-title compact">
+          <div>
+            <h2>会话排行</h2>
+          </div>
+        </div>
+        <div class="top-bars">
+          {#if data && data.topSessions.length > 0}
+            {#each data.topSessions as session}
+              <div class={`top-bar-row ${valueToneClass(session.totalTokens, topSessionPeak)}`} title={`${session.sessionName}\n项目：${session.projectName}\nSession ID：${session.sessionId}`}>
+                <span>{session.projectName}/{session.sessionName}</span>
+                <div class="top-bar-track">
+                  <i style={`width:${barWidth(session.totalTokens, topSessionPeak)}`}></i>
+                </div>
+                <b>{formatToken(session.totalTokens)}</b>
+              </div>
+            {/each}
+          {:else if initialLoading}
+            {#each Array.from({ length: 6 }) as _, index}
+              <div class="top-bar-row skeleton-row">
+                <span aria-hidden="true"></span>
+                <div class="top-bar-track">
+                  <i style={`width:${index === 0 ? "100%" : `${Math.max(8, 54 - index * 8)}%`}`}></i>
+                </div>
+                <b aria-hidden="true"></b>
+              </div>
+            {/each}
+          {:else}
+            <div class="top-empty">暂无会话数据</div>
+          {/if}
+        </div>
+      </section>
+    </section>
+  {/if}
+
+  {#if tooltip.visible}
+    <div
+      class={`floating-tooltip ${tooltip.placement}`}
+      style={`left:${tooltip.x}px; top:${tooltip.y}px;`}
+      role="tooltip"
+      on:mouseenter={cancelTooltipHide}
+      on:mouseleave={scheduleHideTooltip}
+    >{tooltip.text}</div>
+  {/if}
+
+  <footer class="status-line">
+    <span>账本：{formatCount(data?.scanState.ledgerTokenEvents ?? 0)} 条</span>
+    <span>本次新增：{formatCount(data?.scanState.lastRunNewTokenEvents ?? 0)} 条</span>
+    <span>扫描文件：{formatCount(data?.scanState.lastRunFilesScanned ?? 0)} 个</span>
+    <span>解析失败：{formatCount(data?.scanState.lastRunParseErrors ?? 0)} 行</span>
+    <span>截止：{timeText(data?.scanState.lastCutoffUtc)}</span>
+  </footer>
+</main>

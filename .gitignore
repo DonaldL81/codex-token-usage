@@ -1,0 +1,33 @@
+# Local runtime data
+reports/
+_archive/
+docs/
+*.log
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs
+/CodexTokenUsage-*-portable.exe
+dist/
+build/
+target/
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# Dependency caches
+node_modules/
+.pnpm-store/
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Python cache, if helper scripts are added
+__pycache__/
+*.py[cod]
+.pytest_cache/
