@@ -5,6 +5,9 @@
   import { onDestroy, onMount, tick } from "svelte";
 
   type Page = "detail" | "monitor" | "stats";
+  type SortDirection = "asc" | "desc";
+  type DetailSortKey = "node" | "lastTime" | "startTime" | "totalTokens";
+  type MonitorSortKey = "projectSession" | "lastTime" | "totalTokens";
 
   type UsageFilters = {
     dateFrom: string;
@@ -317,6 +320,8 @@
   let expandedDetailRows = new Set<string>();
   let detailExpandLevel: number | null = 0;
   let showOnlyAnomalies = false;
+  let detailSort: { key: DetailSortKey; direction: SortDirection } = { key: "lastTime", direction: "desc" };
+  let monitorSort: { key: MonitorSortKey; direction: SortDirection } = { key: "lastTime", direction: "desc" };
   let updatedDetailRows = new Set<string>();
   let monitorUserInputKeys = new Set<string>();
   let detailTableWrap: HTMLDivElement | null = null;
@@ -350,8 +355,12 @@
     ? filterDetailRowsByStatus(data?.detailRows ?? [], "正常")
     : data?.detailRows ?? [];
   $: detailRowsByKey = new Map((data?.detailRows ?? []).map((row) => [row.rowKey, row]));
-  $: visibleDetailRows = visibleTreeRows(detailRows, expandedDetailRows);
-  $: monitorRows = buildMonitorRows(data?.detailRows ?? [], monitorUserInputKeys, monitorStartedAt);
+  $: sortedDetailRows = sortDetailTreeRows(detailRows, detailSort);
+  $: visibleDetailRows = visibleTreeRows(sortedDetailRows, expandedDetailRows);
+  $: monitorRows = sortMonitorRows(
+    buildMonitorRows(data?.detailRows ?? [], monitorUserInputKeys, monitorStartedAt),
+    monitorSort
+  );
   $: monthlyTrendBuckets = buildMonthlyTrendBuckets(appliedFilters, data?.monthlyBuckets ?? []);
   $: dailyTrendBuckets = buildDailyTrendBuckets(appliedFilters, data?.dailyBuckets ?? []);
   $: hourlyDays = buildHourlyDays(appliedFilters);
@@ -654,6 +663,93 @@
     return rows.filter((row) => keepKeys.has(row.rowKey));
   }
 
+  function updateDetailSort(key: DetailSortKey) {
+    const defaultDirection: SortDirection = key === "node" ? "asc" : "desc";
+    detailSort = detailSort.key === key
+      ? { key, direction: detailSort.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: defaultDirection };
+  }
+
+  function updateMonitorSort(key: MonitorSortKey) {
+    const defaultDirection: SortDirection = key === "projectSession" ? "asc" : "desc";
+    monitorSort = monitorSort.key === key
+      ? { key, direction: monitorSort.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: defaultDirection };
+  }
+
+  function sortIndicator(active: boolean, direction: SortDirection): string {
+    return active ? (direction === "asc" ? "↑" : "↓") : "↕";
+  }
+
+  function sortDetailTreeRows(
+    rows: DetailRow[],
+    sort: { key: DetailSortKey; direction: SortDirection }
+  ): DetailRow[] {
+    const byParent = new Map<string | null, DetailRow[]>();
+    rows.forEach((row) => {
+      const siblings = byParent.get(row.parentKey) ?? [];
+      siblings.push(row);
+      byParent.set(row.parentKey, siblings);
+    });
+
+    const ordered: DetailRow[] = [];
+    const appendChildren = (parentKey: string | null) => {
+      const siblings = [...(byParent.get(parentKey) ?? [])].sort((left, right) => compareDetailRows(left, right, sort));
+      siblings.forEach((row) => {
+        ordered.push(row);
+        appendChildren(row.rowKey);
+      });
+    };
+    appendChildren(null);
+    return ordered;
+  }
+
+  function compareDetailRows(
+    left: DetailRow,
+    right: DetailRow,
+    sort: { key: DetailSortKey; direction: SortDirection }
+  ): number {
+    let result = 0;
+    if (sort.key === "node") {
+      result = detailNodeDisplayText(left).localeCompare(detailNodeDisplayText(right), "zh-CN", {
+        numeric: true,
+        sensitivity: "base"
+      });
+    } else if (sort.key === "totalTokens") {
+      result = left.totalTokens - right.totalTokens;
+    } else {
+      result = detailSortTime(left, sort.key).localeCompare(detailSortTime(right, sort.key));
+    }
+    if (result === 0) result = left.rowKey.localeCompare(right.rowKey);
+    return sort.direction === "asc" ? result : -result;
+  }
+
+  function detailSortTime(row: DetailRow, key: "lastTime" | "startTime"): string {
+    const value = key === "startTime" ? row.startTime || row.time : row.lastTime || row.time;
+    return value.replace(/\D/g, "");
+  }
+
+  function sortMonitorRows(
+    rows: DetailRow[],
+    sort: { key: MonitorSortKey; direction: SortDirection }
+  ): DetailRow[] {
+    return [...rows].sort((left, right) => {
+      let result = 0;
+      if (sort.key === "projectSession") {
+        result = detailProjectSessionText(left).localeCompare(detailProjectSessionText(right), "zh-CN", {
+          numeric: true,
+          sensitivity: "base"
+        });
+      } else if (sort.key === "totalTokens") {
+        result = left.totalTokens - right.totalTokens;
+      } else {
+        result = detailSortTime(left, "lastTime").localeCompare(detailSortTime(right, "lastTime"));
+      }
+      if (result === 0) result = left.rowKey.localeCompare(right.rowKey);
+      return sort.direction === "asc" ? result : -result;
+    });
+  }
+
   function filterSessionOptions(options: FilterOption[], selectedProject: string): FilterOption[] {
     if (!selectedProject) return options;
     return options.filter((option) => option.project === selectedProject);
@@ -791,16 +887,21 @@
     await saveAppConfig({ ...settings, refreshIntervalSeconds: nextInterval }, { refreshAfter: false });
   }
 
-  async function checkUpdate() {
+  async function checkUpdate(options: { autoInstall?: boolean } = {}) {
     if (updateButtonStatus === "checking" || updateButtonStatus === "downloading" || updateButtonStatus === "installing") {
       return;
     }
+    const autoInstall = options.autoInstall ?? true;
     setUpdateButtonStatus("checking");
     error = "";
     try {
       updateInfo = await invoke<UpdateInfo>("check_update", { source: DEFAULT_UPDATE_SOURCE });
       if (updateInfo.hasUpdate && updateInfo.downloadUrl) {
-        setUpdateButtonStatus("ready");
+        if (autoInstall) {
+          await installAvailableUpdate();
+        } else {
+          setUpdateButtonStatus("ready");
+        }
       } else if (updateInfo.hasUpdate) {
         setTemporaryUpdateStatus("failed");
       } else {
@@ -902,11 +1003,7 @@
   }
 
   async function handleUpdateButton() {
-    if (updateButtonStatus === "ready") {
-      await installAvailableUpdate();
-      return;
-    }
-    await checkUpdate();
+    await checkUpdate({ autoInstall: true });
   }
 
   async function exportDetail() {
@@ -1565,7 +1662,7 @@
         统计看板
       </button>
       <button class:active={activePage === "detail"} on:click={() => setPage("detail")}>
-        全部明细
+        全量明细
       </button>
       <button class:active={activePage === "monitor"} on:click={() => setPage("monitor")}>
         实时监控
@@ -1742,7 +1839,7 @@
                 on:click={toggleOnlyAnomalies}
                 disabled={!data}
               >
-                仅超高
+                仅过高
               </button>
               <button on:click={exportDetail} disabled={!data}>导出明细</button>
             {/if}
@@ -1771,20 +1868,97 @@
           </colgroup>
           <thead>
             <tr>
-              <th>{isMonitorPage ? "用户输入" : "层级 / 节点"}</th>
+              <th>
+                {#if isMonitorPage}
+                  用户输入
+                {:else}
+                  <button
+                    type="button"
+                    class="sortable-header"
+                    class:sorted={detailSort.key === "node"}
+                    on:click={() => updateDetailSort("node")}
+                  >
+                    节点 <span>{sortIndicator(detailSort.key === "node", detailSort.direction)}</span>
+                  </button>
+                {/if}
+              </th>
               {#if isMonitorPage}
-                <th>项目 / 会话</th>
+                <th>
+                  <button
+                    type="button"
+                    class="sortable-header"
+                    class:sorted={monitorSort.key === "projectSession"}
+                    on:click={() => updateMonitorSort("projectSession")}
+                  >
+                    项目 / 会话 <span>{sortIndicator(monitorSort.key === "projectSession", monitorSort.direction)}</span>
+                  </button>
+                </th>
               {/if}
-              <th>最后更新时间</th>
+              <th>
+                <button
+                  type="button"
+                  class="sortable-header"
+                  class:sorted={isMonitorPage ? monitorSort.key === "lastTime" : detailSort.key === "lastTime"}
+                  on:click={() => isMonitorPage ? updateMonitorSort("lastTime") : updateDetailSort("lastTime")}
+                >
+                  最后更新时间
+                  <span>{sortIndicator(isMonitorPage ? monitorSort.key === "lastTime" : detailSort.key === "lastTime", isMonitorPage ? monitorSort.direction : detailSort.direction)}</span>
+                </button>
+              </th>
               {#if !isMonitorPage}
-                <th>开始时间</th>
+                <th>
+                  <button
+                    type="button"
+                    class="sortable-header"
+                    class:sorted={detailSort.key === "startTime"}
+                    on:click={() => updateDetailSort("startTime")}
+                  >
+                    开始时间 <span>{sortIndicator(detailSort.key === "startTime", detailSort.direction)}</span>
+                  </button>
+                </th>
               {/if}
               <th>状态</th>
-              <th>总计</th>
-              <th>输入</th>
+              <th>
+                <button
+                  type="button"
+                  class="sortable-header"
+                  class:sorted={isMonitorPage ? monitorSort.key === "totalTokens" : detailSort.key === "totalTokens"}
+                  on:click={() => isMonitorPage ? updateMonitorSort("totalTokens") : updateDetailSort("totalTokens")}
+                >
+                  总计
+                  <span>{sortIndicator(isMonitorPage ? monitorSort.key === "totalTokens" : detailSort.key === "totalTokens", isMonitorPage ? monitorSort.direction : detailSort.direction)}</span>
+                </button>
+              </th>
+              <th>
+                <span class="table-header-with-help">
+                  输入
+                  <button
+                    type="button"
+                    class="header-help"
+                    aria-label="输入说明"
+                    on:mouseenter={(event) => showTooltip(event, "输入 = 缓存输入 + 非缓存输入")}
+                    on:mouseleave={scheduleHideTooltip}
+                    on:focus={(event) => showTooltip(event, "输入 = 缓存输入 + 非缓存输入")}
+                    on:blur={scheduleHideTooltip}
+                  >?</button>
+                </span>
+              </th>
               <th>缓存输入</th>
-              <th>非缓存</th>
-              <th>输出</th>
+              <th>非缓存输入</th>
+              <th>
+                <span class="table-header-with-help">
+                  输出
+                  <button
+                    type="button"
+                    class="header-help"
+                    aria-label="输出说明"
+                    on:mouseenter={(event) => showTooltip(event, "输出 = 推理输出 + 非推理输出")}
+                    on:mouseleave={scheduleHideTooltip}
+                    on:focus={(event) => showTooltip(event, "输出 = 推理输出 + 非推理输出")}
+                    on:blur={scheduleHideTooltip}
+                  >?</button>
+                </span>
+              </th>
               <th>推理输出</th>
             </tr>
           </thead>
