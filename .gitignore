@@ -17,6 +17,10 @@ target/
 app/src-tauri/target/
 app/src-tauri/gen/
 
+# Local release tools
+/app/scripts/
+/【一键打包】build-portable.cmd
+
 # Dependency caches
 node_modules/
 .pnpm-store/
