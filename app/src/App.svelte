@@ -338,7 +338,7 @@
     "输出 Token",
     "推理输出",
     "TokenCount",
-    "异常行"
+    "超高行"
   ];
   const DEFAULT_UPDATE_SOURCE = "DonaldL81/codex-token-usage";
   const monitorStartedAt = new Date();
@@ -996,13 +996,13 @@
   }
 
   function statusClass(status: string): string {
-    if (status === "异常") return "status-bad";
+    if (status === "超高" || status === "异常") return "status-bad";
     if (status === "偏高") return "status-warn";
     return "status-ok";
   }
 
   function totalToneClass(status: string): string {
-    if (status === "异常") return "total-bad";
+    if (status === "超高" || status === "异常") return "total-bad";
     if (status === "偏高") return "total-warn";
     return "total-ok";
   }
@@ -1163,8 +1163,8 @@
 
   function bucketClass(bucket: HourlyBucket | undefined): string {
     if (!bucket || bucket.totalTokens <= 0) return "heat-cell empty";
-    if (bucket.status === "异常") return "heat-cell abnormal";
     const ratio = hourlyPeak <= 0 ? 0 : bucket.totalTokens / hourlyPeak;
+    if (ratio >= 0.82) return "heat-cell strong";
     if (ratio >= 0.66) return "heat-cell high";
     if (ratio >= 0.33) return "heat-cell medium";
     return "heat-cell low";
@@ -1204,12 +1204,19 @@
 
   function trendClass(bucket: TrendBucket, peak: number): string {
     if (!hasTrendData(bucket)) return "";
-    if (bucket.status === "异常") return "tone-abnormal";
-    return peak > 0 && bucket.totalTokens === peak ? "tone-high" : "tone-medium";
+    const ratio = peak <= 0 ? 0 : bucket.totalTokens / peak;
+    if (ratio >= 0.82) return "tone-abnormal";
+    if (ratio >= 0.66) return "tone-high";
+    if (ratio >= 0.33) return "tone-medium";
+    return "tone-low";
   }
 
-  function rankToneClass(index: number): string {
-    return index === 0 ? "tone-high" : "tone-medium";
+  function rankToneClass(value: number, peak: number): string {
+    const ratio = peak <= 0 ? 0 : value / peak;
+    if (ratio >= 0.82) return "tone-abnormal";
+    if (ratio >= 0.66) return "tone-high";
+    if (ratio >= 0.33) return "tone-medium";
+    return "tone-low";
   }
 
   function dayLabel(date: string): string {
@@ -1687,7 +1694,7 @@
           <strong>{formatCount(metrics.tokenEventCount)}</strong>
         </article>
         <article>
-          <span>异常行</span>
+          <span>超高行</span>
           <strong class="red">{formatCount(metrics.abnormalCount)}</strong>
         </article>
       {:else}
@@ -1735,7 +1742,7 @@
                 on:click={toggleOnlyAnomalies}
                 disabled={!data}
               >
-                仅异常
+                仅超高
               </button>
               <button on:click={exportDetail} disabled={!data}>导出明细</button>
             {/if}
@@ -1930,7 +1937,7 @@
         <div class="top-bars">
           {#if data && data.topProjects.length > 0}
             {#each data.topProjects.slice(0, 5) as project, index}
-              <div class={`top-bar-row ${rankToneClass(index)}`}>
+              <div class={`top-bar-row ${rankToneClass(project.totalTokens, topProjectPeak)}`}>
                 <em>{index + 1}</em>
                 <span>{project.projectName}</span>
                 <div class="top-bar-track">
@@ -2039,12 +2046,6 @@
           <div>
             <h2>近2周-分时</h2>
           </div>
-          <div class="legend">
-            <span class="low">低</span>
-            <span class="medium">中</span>
-            <span class="high">高</span>
-            <span class="abnormal">异常</span>
-          </div>
         </div>
         <div class="heatmap">
           <div class="hour-labels">
@@ -2085,7 +2086,7 @@
         <div class="top-bars">
           {#if data && data.topSessions.length > 0}
             {#each data.topSessions.slice(0, 5) as session, index}
-              <div class={`top-bar-row session-top-row ${rankToneClass(index)}`} title={`${session.sessionName}\n项目：${session.projectName}\nSession ID：${session.sessionId}`}>
+              <div class={`top-bar-row session-top-row ${rankToneClass(session.totalTokens, topSessionPeak)}`} title={`${session.sessionName}\n项目：${session.projectName}\nSession ID：${session.sessionId}`}>
                 <em>{index + 1}</em>
                 <span class="top-project-name">{session.projectName}</span>
                 <span class="top-session-name">{session.sessionName}</span>

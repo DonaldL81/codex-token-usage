@@ -16,7 +16,7 @@ use std::process::Command;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Emitter, Manager,
+    Emitter, Manager, WindowEvent,
 };
 use walkdir::WalkDir;
 
@@ -700,6 +700,12 @@ pub fn run() {
             }
             "quit" => app.exit(0),
             _ => {}
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.minimize();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
@@ -2786,7 +2792,7 @@ fn load_events(conn: &Connection) -> rusqlite::Result<Vec<TokenEvent>> {
             last_reasoning_output_tokens: row.get(15)?,
             last_total_tokens: row.get(16)?,
             primary_used_percent: row.get(17)?,
-            status: row.get(18)?,
+            status: normalize_status_label(row.get(18)?),
             preceding_action: row.get(19)?,
         })
     })?;
@@ -2832,7 +2838,7 @@ fn apply_filters(
                     return false;
                 }
             }
-            if filters.only_anomalies.unwrap_or(false) && event.status == "正常" {
+            if filters.only_anomalies.unwrap_or(false) && !is_super_high_status(&event.status) {
                 return false;
             }
             if let Some(search) = search.as_deref() {
@@ -2893,7 +2899,10 @@ fn build_metrics(events: &[TokenEvent]) -> MetricsDto {
         .map(|event| (event.session_id.as_str(), event.turn_id.as_str()))
         .collect::<BTreeSet<_>>()
         .len();
-    let abnormal_count = events.iter().filter(|event| event.status != "正常").count();
+    let abnormal_count = events
+        .iter()
+        .filter(|event| is_super_high_status(&event.status))
+        .count();
     let dates = events
         .iter()
         .map(|event| event.date.as_str())
@@ -3618,8 +3627,11 @@ fn sum_events(events: &[TokenEvent]) -> TokenSums {
 }
 
 fn aggregate_status(events: &[TokenEvent]) -> String {
-    if events.iter().any(|event| event.status == "异常") {
-        "异常".to_string()
+    if events
+        .iter()
+        .any(|event| is_super_high_status(&event.status))
+    {
+        "超高".to_string()
     } else if events.iter().any(|event| event.status == "偏高") {
         "偏高".to_string()
     } else {
@@ -3811,8 +3823,8 @@ fn classify_status(
     primary_used_percent: Option<f64>,
 ) -> String {
     let reason = classify_status_reason(total, output, reasoning, primary_used_percent);
-    if reason.starts_with("异常") {
-        "异常".to_string()
+    if reason.starts_with("超高") {
+        "超高".to_string()
     } else if reason.starts_with("偏高") {
         "偏高".to_string()
     } else {
@@ -3827,10 +3839,10 @@ fn classify_status_reason(
     primary_used_percent: Option<f64>,
 ) -> String {
     if total >= ABNORMAL_TOKEN_THRESHOLD {
-        return format!("异常：单条 token_count 达到 {ABNORMAL_TOKEN_THRESHOLD}");
+        return format!("超高：单条 token_count 达到 {ABNORMAL_TOKEN_THRESHOLD}");
     }
     if primary_used_percent.unwrap_or(0.0) >= 95.0 {
-        return "异常：主额度窗口使用率达到 95%".to_string();
+        return "超高：主额度窗口使用率达到 95%".to_string();
     }
     if total >= HIGH_TOKEN_THRESHOLD {
         return format!("偏高：单条 token_count 达到 {HIGH_TOKEN_THRESHOLD}");
@@ -3839,6 +3851,18 @@ fn classify_status_reason(
         return "偏高：推理输出超过普通输出 3 倍".to_string();
     }
     "正常范围内".to_string()
+}
+
+fn is_super_high_status(status: &str) -> bool {
+    matches!(status, "超高" | "异常")
+}
+
+fn normalize_status_label(status: String) -> String {
+    if status == "异常" {
+        "超高".to_string()
+    } else {
+        status
+    }
 }
 
 fn non_cached_tokens(input: i64, cached: i64) -> i64 {
