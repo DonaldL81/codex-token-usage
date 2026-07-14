@@ -1,9 +1,10 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { getVersion } from "@tauri-apps/api/app";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onDestroy, onMount, tick } from "svelte";
 
-  type Page = "detail" | "stats";
+  type Page = "detail" | "monitor" | "stats";
 
   type UsageFilters = {
     dateFrom: string;
@@ -218,6 +219,11 @@
     displayLabel: string;
   };
 
+  type MonthlyTrendBucket = TrendBucket & {
+    inRange: boolean;
+    displayLabel: string;
+  };
+
   type CalendarDay = {
     value: string;
     label: number;
@@ -293,6 +299,7 @@
   let rangeAnchor: string | null = null;
   let settingsMessage = "";
   let updateInfo: UpdateInfo | null = null;
+  let appVersion = "";
   let updateRuntimeInfo: UpdateRuntimeInfo | null = null;
   let updateButtonStatus: "idle" | "checking" | "latest" | "ready" | "downloading" | "installing" | "failed" =
     "idle";
@@ -311,6 +318,7 @@
   let detailExpandLevel: number | null = 0;
   let showOnlyAnomalies = false;
   let updatedDetailRows = new Set<string>();
+  let monitorUserInputKeys = new Set<string>();
   let detailTableWrap: HTMLDivElement | null = null;
   let tooltip: TooltipState = { visible: false, text: "", x: 0, y: 0, placement: "below" };
   let tooltipHideTimer: ReturnType<typeof setTimeout> | null = null;
@@ -333,6 +341,7 @@
     "异常行"
   ];
   const DEFAULT_UPDATE_SOURCE = "DonaldL81/codex-token-usage";
+  const monitorStartedAt = new Date();
 
   $: metrics = data?.metrics;
   $: initialLoading = loading && !data;
@@ -340,13 +349,16 @@
   $: detailRows = showOnlyAnomalies
     ? filterDetailRowsByStatus(data?.detailRows ?? [], "正常")
     : data?.detailRows ?? [];
+  $: detailRowsByKey = new Map((data?.detailRows ?? []).map((row) => [row.rowKey, row]));
   $: visibleDetailRows = visibleTreeRows(detailRows, expandedDetailRows);
+  $: monitorRows = buildMonitorRows(data?.detailRows ?? [], monitorUserInputKeys, monitorStartedAt);
+  $: monthlyTrendBuckets = buildMonthlyTrendBuckets(appliedFilters, data?.monthlyBuckets ?? []);
   $: dailyTrendBuckets = buildDailyTrendBuckets(appliedFilters, data?.dailyBuckets ?? []);
   $: hourlyDays = buildHourlyDays(appliedFilters);
   $: hourlyMap = buildHourlyMap(data?.hourlyBuckets ?? []);
   $: hourlyPeak = Math.max(...(data?.hourlyBuckets ?? []).map((bucket) => bucket.totalTokens), 0);
   $: dailyPeak = Math.max(...dailyTrendBuckets.map((bucket) => bucket.totalTokens), 0);
-  $: monthlyPeak = Math.max(...(data?.monthlyBuckets ?? []).map((bucket) => bucket.totalTokens), 0);
+  $: monthlyPeak = Math.max(...monthlyTrendBuckets.filter((bucket) => bucket.inRange).map((bucket) => bucket.totalTokens), 0);
   $: topProjectPeak = Math.max(...(data?.topProjects ?? []).map((project) => project.totalTokens), 0);
   $: topSessionPeak = Math.max(...(data?.topSessions ?? []).map((session) => session.totalTokens), 0);
   $: calendarMonths = [
@@ -373,6 +385,13 @@
   }
 
   onMount(() => {
+    void getVersion()
+      .then((version) => {
+        appVersion = version;
+      })
+      .catch(() => {
+        appVersion = "";
+      });
     restoreUiState();
     refreshUsage();
     listen("tray-refresh", () => refreshUsage())
@@ -406,7 +425,13 @@
   });
 
   async function refreshUsage() {
-    await loadDashboard("refresh_usage", { preserveView: true, filters: appliedFilters });
+    if (loading) {
+      return;
+    }
+    normalizeDateRange();
+    syncDateRangeDraft();
+    showDateRangePicker = false;
+    await loadDashboard("refresh_usage", { preserveView: true, filters });
   }
 
   async function applyFilters() {
@@ -438,10 +463,15 @@
       const nextData = await invoke<DashboardData>(command, {
         filters: requestFilters
       });
-      updatedDetailRows =
-        command === "refresh_usage" && data
+      const canCompareRows = command === "refresh_usage" && Boolean(data) && filtersEqual(requestFilters, appliedFilters);
+      const changedRows =
+        canCompareRows && data
           ? changedDetailRows(data.detailRows, nextData.detailRows)
-          : new Set();
+          : new Set<string>();
+      updatedDetailRows = changedRows;
+      if (canCompareRows) {
+        monitorUserInputKeys = collectMonitorUserInputKeys(monitorUserInputKeys, changedRows, nextData.detailRows);
+      }
       data = nextData;
       appliedFilters = requestFilters;
       if (snapshot) {
@@ -525,6 +555,64 @@
       row.status,
       row.statusReason
     ].join("|");
+  }
+
+  function filtersEqual(a: UsageFilters, b: UsageFilters): boolean {
+    return (
+      a.dateFrom === b.dateFrom &&
+      a.dateTo === b.dateTo &&
+      a.project === b.project &&
+      a.session === b.session &&
+      a.search === b.search
+    );
+  }
+
+  function collectMonitorUserInputKeys(
+    existingKeys: Set<string>,
+    changedRows: Set<string>,
+    rows: DetailRow[]
+  ): Set<string> {
+    if (changedRows.size === 0) return existingKeys;
+    const byKey = new Map(rows.map((row) => [row.rowKey, row]));
+    const next = new Set(existingKeys);
+    for (const key of changedRows) {
+      const row = byKey.get(key);
+      const inputKey = row ? userInputKeyForRow(row, byKey) : null;
+      if (inputKey) {
+        next.add(inputKey);
+      }
+    }
+    return next;
+  }
+
+  function buildMonitorRows(rows: DetailRow[], userInputKeys: Set<string>, startedAt: Date): DetailRow[] {
+    if (userInputKeys.size === 0) return [];
+    return rows.filter(
+      (row) => row.kind === "UserInput" && userInputKeys.has(row.rowKey) && isAfterMonitorStart(row, startedAt)
+    );
+  }
+
+  function isAfterMonitorStart(row: DetailRow, startedAt: Date): boolean {
+    const rowTime = parseLocalDateTime(row.lastTime || row.time);
+    return Boolean(rowTime && rowTime.getTime() >= startedAt.getTime());
+  }
+
+  function userInputKeyForRow(row: DetailRow, byKey = detailRowsByKey): string | null {
+    let current: DetailRow | undefined = row;
+    while (current) {
+      if (current.kind === "UserInput") return current.rowKey;
+      current = current.parentKey ? byKey.get(current.parentKey) : undefined;
+    }
+    return null;
+  }
+
+  function ancestorOfKind(row: DetailRow, kind: string, byKey = detailRowsByKey): DetailRow | null {
+    let current: DetailRow | undefined = row;
+    while (current) {
+      if (current.kind === kind) return current;
+      current = current.parentKey ? byKey.get(current.parentKey) : undefined;
+    }
+    return null;
   }
 
   function resetFilters() {
@@ -913,6 +1001,12 @@
     return "status-ok";
   }
 
+  function totalToneClass(status: string): string {
+    if (status === "异常") return "total-bad";
+    if (status === "偏高") return "total-warn";
+    return "total-ok";
+  }
+
   function levelLabel(level: number): string {
     return ["P", "S", "I", "T", "#"][level] ?? "-";
   }
@@ -933,6 +1027,36 @@
     if (row.kind === "Turn") return row.node.replace(/^Turn\s*/, "");
     if (row.kind === "TokenCount") return row.node.replace(/^TokenCount\s*/, "");
     return row.node;
+  }
+
+  function detailNodeDisplayText(row: DetailRow): string {
+    if (row.kind !== "UserInput") return detailNodeText(row);
+    const fullText = row.nodeTooltip.replace(/^用户输入\s*\n?/, "").trim();
+    const actualInput = extractActualUserInput(fullText);
+    return actualInput ? compactOneLine(actualInput) : detailNodeText(row);
+  }
+
+  function detailTooltipText(row: DetailRow): string {
+    if (row.kind !== "TokenCount") return row.nodeTooltip;
+    return row.nodeTooltip.replace(/\n?完整用户输入[:：][\s\S]*$/u, "").trim();
+  }
+
+  function extractActualUserInput(text: string): string {
+    const match = text.match(/(?:^|\n)#{1,6}\s*My request for Codex:\s*/i);
+    if (!match || match.index === undefined) return "";
+    return text.slice(match.index + match[0].length).trim();
+  }
+
+  function compactOneLine(text: string): string {
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  function detailProjectSessionText(row: DetailRow): string {
+    const projectRow = ancestorOfKind(row, "Project");
+    const sessionRow = ancestorOfKind(row, "Session");
+    const projectName = projectRow ? detailNodeText(projectRow) : row.project || "-";
+    const sessionName = sessionRow ? detailNodeText(sessionRow) : row.sessionId || "-";
+    return `${projectName}/${sessionName}`;
   }
 
   function showTooltip(event: MouseEvent | FocusEvent, text: string) {
@@ -1011,10 +1135,30 @@
     });
   }
 
+  function buildMonthlyTrendBuckets(currentFilters: UsageFilters, buckets: TrendBucket[]): MonthlyTrendBucket[] {
+    return buckets.map((bucket) => {
+      const inRange = monthWithinFilters(bucket.label, currentFilters);
+      return {
+        ...bucket,
+        inRange,
+        displayLabel: inRange ? bucket.label : "-"
+      };
+    });
+  }
+
   function dateWithinFilters(date: string, currentFilters: UsageFilters): boolean {
     const from = currentFilters.dateFrom || "0000-00-00";
     const to = currentFilters.dateTo || "9999-99-99";
     return date >= from && date <= to;
+  }
+
+  function monthWithinFilters(month: string, currentFilters: UsageFilters): boolean {
+    const monthStart = parseDateValue(`${month}-01`);
+    if (!monthStart) return false;
+    const monthEnd = formatDateValue(addDays(addMonths(monthStart, 1), -1));
+    const from = currentFilters.dateFrom || "0000-00-00";
+    const to = currentFilters.dateTo || "9999-99-99";
+    return monthEnd >= from && `${month}-01` <= to;
   }
 
   function bucketClass(bucket: HourlyBucket | undefined): string {
@@ -1030,8 +1174,22 @@
     return bucket.totalTokens > 0;
   }
 
-  function trendValueText(bucket: TrendBucket): string {
-    return hasTrendData(bucket) ? formatToken(bucket.totalTokens) : "-";
+  function trendValueText(bucket: TrendBucket, compact = false): string {
+    if (!hasTrendData(bucket)) return "-";
+    return compact ? formatCompactToken(bucket.totalTokens) : formatToken(bucket.totalTokens);
+  }
+
+  function rangedTrendValueText(bucket: TrendBucket, inRange: boolean, compact = false): string {
+    if (!inRange) return "-";
+    if (!hasTrendData(bucket)) return "0";
+    return compact ? formatCompactToken(bucket.totalTokens) : formatToken(bucket.totalTokens);
+  }
+
+  function formatCompactToken(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return "-";
+    if (value < 10000) return Math.round(value).toString();
+    if (value >= 100000000) return `${trimUnit(value / 100000000, 1)}亿`;
+    return `${trimUnit(value / 10000, 0)}万`;
   }
 
   function trendHeight(bucket: TrendBucket, peak: number): string {
@@ -1044,20 +1202,14 @@
     return `${Math.max((value / peak) * 100, 2)}%`;
   }
 
-  function valueToneClass(value: number, peak: number): string {
-    if (peak <= 0 || value <= 0) return "tone-low";
-    const ratio = value / peak;
-    if (ratio >= 0.85) return "tone-abnormal";
-    if (ratio >= 0.6) return "tone-high";
-    if (ratio >= 0.25) return "tone-medium";
-    return "tone-low";
+  function trendClass(bucket: TrendBucket, peak: number): string {
+    if (!hasTrendData(bucket)) return "";
+    if (bucket.status === "异常") return "tone-abnormal";
+    return peak > 0 && bucket.totalTokens === peak ? "tone-high" : "tone-medium";
   }
 
-  function trendClass(bucket: TrendBucket): string {
-    if (!hasTrendData(bucket)) return "";
-    if (bucket.status === "异常") return "bad";
-    if (bucket.status === "偏高") return "warn";
-    return "ok";
+  function rankToneClass(index: number): string {
+    return index === 0 ? "tone-high" : "tone-medium";
   }
 
   function dayLabel(date: string): string {
@@ -1163,6 +1315,17 @@
     return cleanValue.slice(0, 16).replaceAll("-", "/");
   }
 
+  function parseLocalDateTime(value: string): Date | null {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const withOffset = trimmed.replaceAll("/", "-").replace(/\s+([+-]\d{2}:\d{2})$/, "$1").replace(" ", "T");
+    const parsed = new Date(withOffset);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+    const withoutOffset = trimmed.replaceAll("/", "-").replace(/\s+[+-]\d{2}:\d{2}$/, "").replace(" ", "T");
+    const fallback = new Date(withoutOffset);
+    return Number.isNaN(fallback.getTime()) ? null : fallback;
+  }
+
   function normalizeDateRange() {
     const from = parseDateValue(filters.dateFrom);
     const to = parseDateValue(filters.dateTo);
@@ -1206,14 +1369,25 @@
     return `${trimUnit((value / total) * 100, 1)}%`;
   }
 
-  function ringSegmentStyle(segments: Array<{ value: number; color: string }>, total: number): string {
+  type RingTheme = {
+    color: string;
+  };
+
+  const ringThemes = {
+    low: { color: "var(--chart-blue-low)" },
+    medium: { color: "var(--chart-blue-medium)" },
+    high: { color: "var(--chart-blue-high)" },
+    strong: { color: "var(--chart-blue-strong)" }
+  } satisfies Record<string, RingTheme>;
+
+  function ringSegmentStyle(segments: Array<{ value: number; theme: RingTheme }>, total: number): string {
     if (total <= 0) return "conic-gradient(#eef3f9 0deg 360deg)";
     let cursor = 0;
-    const parts = segments.map((segment) => {
+    const parts = segments.filter((segment) => segment.value > 0).map((segment) => {
       const span = Math.max((segment.value / total) * 360, 0);
       const start = cursor;
       cursor += span;
-      return `${segment.color} ${start}deg ${cursor}deg`;
+      return `${segment.theme.color} ${start}deg ${cursor}deg`;
     });
     if (cursor < 360) {
       parts.push(`#eef3f9 ${cursor}deg 360deg`);
@@ -1228,8 +1402,8 @@
   function totalRingStyle(metricValues: Metrics): string {
     return ringSegmentStyle(
       [
-        { value: metricValues.inputTokens, color: "var(--data-blue)" },
-        { value: outputTotal(metricValues), color: "var(--data-green)" }
+        { value: metricValues.inputTokens, theme: ringThemes.strong },
+        { value: outputTotal(metricValues), theme: ringThemes.medium }
       ],
       metricValues.totalTokens
     );
@@ -1238,8 +1412,8 @@
   function inputRingStyle(metricValues: Metrics): string {
     return ringSegmentStyle(
       [
-        { value: metricValues.cachedInputTokens, color: "var(--data-green)" },
-        { value: metricValues.nonCachedInputTokens, color: "var(--data-orange)" }
+        { value: metricValues.cachedInputTokens, theme: ringThemes.high },
+        { value: metricValues.nonCachedInputTokens, theme: ringThemes.low }
       ],
       metricValues.inputTokens
     );
@@ -1248,8 +1422,8 @@
   function outputRingStyle(metricValues: Metrics): string {
     return ringSegmentStyle(
       [
-        { value: metricValues.outputTokens, color: "var(--data-blue)" },
-        { value: metricValues.reasoningOutputTokens, color: "var(--data-red)" }
+        { value: metricValues.reasoningOutputTokens, theme: ringThemes.medium },
+        { value: metricValues.outputTokens, theme: ringThemes.low }
       ],
       outputTotal(metricValues)
     );
@@ -1264,32 +1438,12 @@
   <header class="topbar">
     <div>
       <h1>Codex Token Usage</h1>
-      <p>本机日志实时统计与分层明细</p>
+      <p>Codex Token 消耗统计分析看板</p>
     </div>
     <div class="toolbar-controls topbar-controls">
-      <label class="toolbar-field session-root-field">
-        <span>会话目录</span>
-        <div class="toolbar-input-group">
-          <input
-            type="text"
-            bind:value={draftSessionsRoot}
-            readonly={!editingSessionsRoot}
-            title={draftSessionsRoot}
-          />
-          {#if editingSessionsRoot}
-            <button type="button" class="primary" on:click={saveSessionsRoot} disabled={loading || !draftSessionsRoot.trim()}>
-              保存
-            </button>
-            <button type="button" on:click={cancelEditSessionsRoot} disabled={loading}>取消</button>
-          {:else}
-            <button type="button" on:click={startEditSessionsRoot} disabled={loading}>编辑</button>
-          {/if}
-        </div>
-      </label>
-      <button class="danger" on:click={rebuildLedger} disabled={!data || loading}>重建数据库</button>
       <label class="toolbar-field refresh-field">
-        <span>自动刷新(s)</span>
         <div class="toolbar-input-group">
+          <span class="toolbar-input-title">自动刷新(s)</span>
           <input
             type="number"
             min="0"
@@ -1298,23 +1452,91 @@
             readonly={!editingRefreshInterval}
           />
           {#if editingRefreshInterval}
-            <button type="button" class="primary" on:click={saveRefreshInterval} disabled={loading}>保存</button>
-            <button type="button" on:click={cancelEditRefreshInterval} disabled={loading}>取消</button>
+            <button
+              type="button"
+              class="icon-button primary"
+              title="保存自动刷新秒数"
+              aria-label="保存自动刷新秒数"
+              on:click={saveRefreshInterval}
+              disabled={loading}
+            >
+              ✓
+            </button>
+            <button
+              type="button"
+              class="icon-button"
+              title="取消编辑自动刷新秒数"
+              aria-label="取消编辑自动刷新秒数"
+              on:click={cancelEditRefreshInterval}
+              disabled={loading}
+            >
+              ×
+            </button>
           {:else}
-            <button type="button" on:click={startEditRefreshInterval} disabled={loading}>编辑</button>
+            <button
+              type="button"
+              class="icon-button edit-button"
+              title="编辑自动刷新秒数"
+              aria-label="编辑自动刷新秒数"
+              on:click={startEditRefreshInterval}
+              disabled={loading}
+            >
+              <svg class="edit-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z" />
+                <path d="M14 7l3 3" />
+              </svg>
+            </button>
           {/if}
         </div>
       </label>
-      <button
-        class:primary={updateButtonStatus === "ready" || updateButtonStatus === "installing"}
-        on:click={handleUpdateButton}
-        disabled={updateButtonDisabled()}
-      >
-        {updateButtonLabel()}
-      </button>
-      <button class="primary" on:click={refreshUsage} disabled={loading}>
-        {loading ? "刷新中" : "刷新"}
-      </button>
+      <label class="toolbar-field session-root-field">
+        <div class="toolbar-input-group">
+          <span class="toolbar-input-title">会话目录</span>
+          <input
+            type="text"
+            bind:value={draftSessionsRoot}
+            readonly={!editingSessionsRoot}
+            title={draftSessionsRoot}
+          />
+          {#if editingSessionsRoot}
+            <button
+              type="button"
+              class="icon-button primary"
+              title="保存会话目录"
+              aria-label="保存会话目录"
+              on:click={saveSessionsRoot}
+              disabled={loading || !draftSessionsRoot.trim()}
+            >
+              ✓
+            </button>
+            <button
+              type="button"
+              class="icon-button"
+              title="取消编辑会话目录"
+              aria-label="取消编辑会话目录"
+              on:click={cancelEditSessionsRoot}
+              disabled={loading}
+            >
+              ×
+            </button>
+          {:else}
+            <button
+              type="button"
+              class="icon-button edit-button"
+              title="编辑会话目录"
+              aria-label="编辑会话目录"
+              on:click={startEditSessionsRoot}
+              disabled={loading}
+            >
+              <svg class="edit-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z" />
+                <path d="M14 7l3 3" />
+              </svg>
+            </button>
+          {/if}
+        </div>
+      </label>
+      <button class="danger" on:click={rebuildLedger} disabled={!data || loading}>重建数据库</button>
     </div>
   </header>
 
@@ -1330,68 +1552,30 @@
     <section class="notice">{settingsMessage || exportMessage}</section>
   {/if}
 
-  {#if metrics || initialLoading}
-    <section class="metric-grid" class:loading-skeleton={initialLoading}>
-      {#if metrics}
-        <article>
-          <span>当前筛选总 Token</span>
-          <strong class="blue">{formatToken(metrics.totalTokens)}</strong>
-        </article>
-        <article>
-          <span>输入 Token</span>
-          <strong class="blue">{formatToken(metrics.inputTokens)}</strong>
-        </article>
-        <article>
-          <span>缓存输入</span>
-          <strong class="green">{formatToken(metrics.cachedInputTokens)}</strong>
-        </article>
-        <article>
-          <span>非缓存输入</span>
-          <strong class="orange">{formatToken(metrics.nonCachedInputTokens)}</strong>
-        </article>
-        <article>
-          <span>输出 Token</span>
-          <strong class="blue">{formatToken(metrics.outputTokens)}</strong>
-        </article>
-        <article>
-          <span>推理输出</span>
-          <strong class="red">{formatToken(metrics.reasoningOutputTokens)}</strong>
-        </article>
-        <article>
-          <span>TokenCount</span>
-          <strong>{formatCount(metrics.tokenEventCount)}</strong>
-        </article>
-        <article>
-          <span>异常行</span>
-          <strong class="red">{formatCount(metrics.abnormalCount)}</strong>
-        </article>
-      {:else}
-        {#each metricSkeletonLabels as label}
-          <article>
-            <span>{label}</span>
-            <strong aria-hidden="true"></strong>
-          </article>
-        {/each}
-      {/if}
-    </section>
-  {/if}
-
   <section class="view-toolbar">
     <nav aria-label="页面">
       <button class:active={activePage === "stats"} on:click={() => setPage("stats")}>
-        统计页
+        统计看板
       </button>
       <button class:active={activePage === "detail"} on:click={() => setPage("detail")}>
-        明细页
+        全部明细
+      </button>
+      <button class:active={activePage === "monitor"} on:click={() => setPage("monitor")}>
+        实时监控
       </button>
     </nav>
     <section class="filters header-filters">
       <div class="date-range-filter">
-        <span>日期范围</span>
-        <button type="button" class="date-range-button" on:click={toggleDateRangePicker}>
-          {showDateRangePicker
-            ? dateRangeText(draftDateFrom, draftDateTo)
-            : dateRangeText(filters.dateFrom, filters.dateTo)}
+        <button type="button" class="date-range-button" aria-label="日期范围" on:click={toggleDateRangePicker}>
+          <span>
+            {showDateRangePicker
+              ? dateRangeText(draftDateFrom, draftDateTo)
+              : dateRangeText(filters.dateFrom, filters.dateTo)}
+          </span>
+          <svg class="date-range-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3.5" y="5" width="17" height="15.5" rx="2" />
+            <path d="M7 3.5v3M17 3.5v3M4 9h16" />
+          </svg>
         </button>
         {#if showDateRangePicker}
           <div class="date-range-popover">
@@ -1444,8 +1628,7 @@
         {/if}
       </div>
       <label>
-        <span>项目</span>
-        <select value={filters.project} on:change={handleProjectSelect}>
+        <select value={filters.project} aria-label="项目" on:change={handleProjectSelect}>
           <option value="">全部项目</option>
           {#each data?.projectOptions ?? [] as project}
             <option value={project.value} title={project.title}>{project.label}</option>
@@ -1453,8 +1636,7 @@
         </select>
       </label>
       <label>
-        <span>会话</span>
-        <select value={filters.session} on:change={handleSessionSelect}>
+        <select value={filters.session} aria-label="会话" on:change={handleSessionSelect}>
           <option value="">全部会话</option>
           {#each filteredSessionOptions as session}
             <option value={session.value} title={session.title}>{session.label}</option>
@@ -1462,58 +1644,116 @@
         </select>
       </label>
       <label class="search">
-        <span>搜索</span>
         <div class="search-control">
-          <input type="search" placeholder="项目名称 / 会话名称 / 输入内容" bind:value={filters.search} />
-          <button type="button" on:click={applyFilters} disabled={loading}>查询</button>
+          <input type="search" aria-label="搜索" placeholder="项目名称 / 会话名称 / 输入内容" bind:value={filters.search} />
         </div>
       </label>
       <button class="ghost" on:click={resetFilters} disabled={loading}>重置</button>
+      <button class="primary" on:click={refreshUsage} disabled={loading}>
+        {loading ? "刷新中" : "刷新"}
+      </button>
     </section>
   </section>
 
-  {#if activePage === "detail"}
-    <section class="panel">
+  {#if metrics || initialLoading}
+    <section class="metric-grid" class:loading-skeleton={initialLoading}>
+      {#if metrics}
+        <article>
+          <span>当前筛选总 Token</span>
+          <strong class="blue">{formatToken(metrics.totalTokens)}</strong>
+        </article>
+        <article>
+          <span>输入 Token</span>
+          <strong class="blue">{formatToken(metrics.inputTokens)}</strong>
+        </article>
+        <article>
+          <span>缓存输入</span>
+          <strong class="green">{formatToken(metrics.cachedInputTokens)}</strong>
+        </article>
+        <article>
+          <span>非缓存输入</span>
+          <strong class="orange">{formatToken(metrics.nonCachedInputTokens)}</strong>
+        </article>
+        <article>
+          <span>输出 Token</span>
+          <strong class="blue">{formatToken(metrics.outputTokens)}</strong>
+        </article>
+        <article>
+          <span>推理输出</span>
+          <strong class="blue">{formatToken(metrics.reasoningOutputTokens)}</strong>
+        </article>
+        <article>
+          <span>TokenCount</span>
+          <strong>{formatCount(metrics.tokenEventCount)}</strong>
+        </article>
+        <article>
+          <span>异常行</span>
+          <strong class="red">{formatCount(metrics.abnormalCount)}</strong>
+        </article>
+      {:else}
+        {#each metricSkeletonLabels as label}
+          <article>
+            <span>{label}</span>
+            <strong aria-hidden="true"></strong>
+          </article>
+        {/each}
+      {/if}
+    </section>
+  {/if}
+
+  {#if activePage === "detail" || activePage === "monitor"}
+    {@const detailTableRows = activePage === "monitor" ? monitorRows : visibleDetailRows}
+    {@const detailTotalRows = activePage === "monitor" ? monitorRows.length : data?.detailRows.length ?? 0}
+    {@const isMonitorPage = activePage === "monitor"}
+    <section class="panel detail-panel">
       <div class="panel-title detail-title">
-        <div class="detail-title-top">
-          <h2>Token用量明细</h2>
-        </div>
         <div class="detail-controls-row">
-          <div class="level-legend">
-            {#each detailLevelControls as control}
+          {#if isMonitorPage}
+            <div class="detail-note">仅展示本次启动后新增或变动会话中的用户输入。</div>
+          {:else}
+            <div class="level-legend">
+              {#each detailLevelControls as control}
+                <button
+                  type="button"
+                  class:active={detailExpandLevel === control.level}
+                  on:click={() => expandDetailToLevel(control.level)}
+                  disabled={!data}
+                >
+                  <i class={`dot level-${control.level}`}>{control.icon}</i>
+                  <strong>{control.label}</strong>
+                  <span>{control.english}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+          <div class="detail-tools">
+            <span class="row-count">{formatCount(detailTableRows.length)} / {formatCount(detailTotalRows)} 行</span>
+            {#if !isMonitorPage}
               <button
                 type="button"
-                class:active={detailExpandLevel === control.level}
-                on:click={() => expandDetailToLevel(control.level)}
+                class:active={showOnlyAnomalies}
+                on:click={toggleOnlyAnomalies}
                 disabled={!data}
               >
-                <i class={`dot level-${control.level}`}>{control.icon}</i>
-                <strong>{control.label}</strong>
-                <span>{control.english}</span>
+                仅异常
               </button>
-            {/each}
-          </div>
-          <div class="detail-tools">
-            <span class="row-count">{formatCount(visibleDetailRows.length)} / {formatCount(data?.detailRows.length ?? 0)} 行</span>
-            <button
-              type="button"
-              class:active={showOnlyAnomalies}
-              on:click={toggleOnlyAnomalies}
-              disabled={!data}
-            >
-              仅异常
-            </button>
-            <button on:click={exportDetail} disabled={!data}>导出明细</button>
+              <button on:click={exportDetail} disabled={!data}>导出明细</button>
+            {/if}
           </div>
         </div>
       </div>
 
-      <div class="table-wrap detail" bind:this={detailTableWrap}>
+      <div class:monitor={isMonitorPage} class="table-wrap detail" bind:this={detailTableWrap}>
         <table>
           <colgroup>
             <col class="col-node" />
-            <col class="col-start-time" />
+            {#if isMonitorPage}
+              <col class="col-project-session" />
+            {/if}
             <col class="col-last-time" />
+            {#if !isMonitorPage}
+              <col class="col-start-time" />
+            {/if}
             <col class="col-status" />
             <col class="col-token" />
             <col class="col-token" />
@@ -1524,9 +1764,14 @@
           </colgroup>
           <thead>
             <tr>
-              <th>层级 / 节点</th>
-              <th>开始时间</th>
+              <th>{isMonitorPage ? "用户输入" : "层级 / 节点"}</th>
+              {#if isMonitorPage}
+                <th>项目 / 会话</th>
+              {/if}
               <th>最后更新时间</th>
+              {#if !isMonitorPage}
+                <th>开始时间</th>
+              {/if}
               <th>状态</th>
               <th>总计</th>
               <th>输入</th>
@@ -1537,41 +1782,59 @@
             </tr>
           </thead>
           <tbody>
-            {#if data && data.detailRows.length > 0}
-              {#each visibleDetailRows as row}
+            {#if data && detailTableRows.length > 0}
+              {#each detailTableRows as row}
               <tr>
-                <td class="node" style={`--indent:${row.level * 18}px`}>
-                  {#if row.hasChildren}
+                <td class="node" style={`--indent:${isMonitorPage ? 0 : row.level * 18}px`}>
+                  {#if isMonitorPage}
                     <button
-                      class="tree-toggle"
-                      aria-label={expandedDetailRows.has(row.rowKey) ? "折叠" : "展开"}
-                      on:click={() => toggleDetailRow(row.rowKey)}
+                      type="button"
+                      class="node-label node-tooltip-trigger monitor-input-label"
+                      on:mouseenter={(event) => showTooltip(event, detailTooltipText(row))}
+                      on:mouseleave={scheduleHideTooltip}
+                      on:focus={(event) => showTooltip(event, detailTooltipText(row))}
+                      on:blur={scheduleHideTooltip}
                     >
-                      {expandedDetailRows.has(row.rowKey) ? "▾" : "▸"}
+                      {detailNodeDisplayText(row)}
                     </button>
                   {:else}
-                    <span class="tree-spacer"></span>
-                  {/if}
-                  <span class={`dot level-${row.level}`}>{levelLabel(row.level)}</span>
+                    {#if row.hasChildren}
+                      <button
+                        class="tree-toggle"
+                        aria-label={expandedDetailRows.has(row.rowKey) ? "折叠" : "展开"}
+                        on:click={() => toggleDetailRow(row.rowKey)}
+                      >
+                        {expandedDetailRows.has(row.rowKey) ? "▾" : "▸"}
+                      </button>
+                    {:else}
+                      <span class="tree-spacer"></span>
+                    {/if}
                     <button
                       type="button"
                       class="node-label node-tooltip-trigger"
-                      on:mouseenter={(event) => showTooltip(event, row.nodeTooltip)}
+                      on:mouseenter={(event) => showTooltip(event, detailTooltipText(row))}
                       on:mouseleave={scheduleHideTooltip}
-                      on:focus={(event) => showTooltip(event, row.nodeTooltip)}
+                      on:focus={(event) => showTooltip(event, detailTooltipText(row))}
                       on:blur={scheduleHideTooltip}
                     >
-                      <strong class="node-type">{detailKindLabel(row.kind)}：</strong>{detailNodeText(row)}
+                      <span class={`dot level-${row.level}`}>{levelLabel(row.level)}</span>
+                      <strong class="node-type">{detailKindLabel(row.kind)}：</strong>{detailNodeDisplayText(row)}
                     </button>
+                  {/if}
                   </td>
-                <td>{formatDetailStartTime(row)}</td>
+                {#if isMonitorPage}
+                  <td class="project-session" title={detailProjectSessionText(row)}>{detailProjectSessionText(row)}</td>
+                {/if}
                 <td>
                   <span class="time-cell" class:updated={updatedDetailRows.has(row.rowKey)}>
                     {formatDetailLastTime(row)}
                   </span>
                 </td>
+                {#if !isMonitorPage}
+                  <td>{formatDetailStartTime(row)}</td>
+                {/if}
                 <td><span class={`status ${statusClass(row.status)}`} title={row.statusReason}>{row.status}</span></td>
-                <td class="total">{formatToken(row.totalTokens)}</td>
+                <td class={`total ${totalToneClass(row.status)}`}>{formatToken(row.totalTokens)}</td>
                 <td>{formatToken(row.inputTokens)}</td>
                 <td>{formatToken(row.cachedInputTokens)}</td>
                 <td>{formatToken(row.nonCachedInputTokens)}</td>
@@ -1582,7 +1845,11 @@
             {:else}
               <tr>
                 <td class="empty-row" colspan="10">
-                  {loading ? "正在读取本机 Codex 日志..." : "当前筛选条件下没有明细记录"}
+                  {loading
+                    ? "正在读取本机 Codex 日志..."
+                    : isMonitorPage
+                      ? "本次启动后暂无新增或变动会话"
+                      : "当前筛选条件下没有明细记录"}
                 </td>
               </tr>
             {/if}
@@ -1593,16 +1860,16 @@
   {:else}
     <section class="stats-layout" class:initial-loading={initialLoading}>
       <section class="trend-card month-trend-panel">
-        <h3>半年趋势</h3>
-        {#if data && data.monthlyBuckets.length > 0}
+        <h3>近6月-趋势</h3>
+        {#if data && monthlyTrendBuckets.length > 0}
           <div class="vertical-chart">
-            {#each data.monthlyBuckets as bucket}
-              <div class="chart-column" title={hasTrendData(bucket) ? `${bucket.label} ${formatToken(bucket.totalTokens)}` : `${bucket.label} 无数据`}>
-                <b>{trendValueText(bucket)}</b>
+            {#each monthlyTrendBuckets as bucket}
+              <div class="chart-column" title={bucket.inRange ? `${bucket.label} ${formatToken(bucket.totalTokens)}` : "不在查询范围内"}>
+                <b>{rangedTrendValueText(bucket, bucket.inRange)}</b>
                 <div class="chart-track">
-                  <i class={trendClass(bucket)} style={`height:${trendHeight(bucket, monthlyPeak)}`}></i>
+                  <i class={bucket.inRange ? trendClass(bucket, monthlyPeak) : ""} style={`height:${bucket.inRange ? trendHeight(bucket, monthlyPeak) : "0%"}`}></i>
                 </div>
-                <span>{hasTrendData(bucket) ? bucket.label : "-"}</span>
+                <span>{bucket.displayLabel}</span>
               </div>
             {/each}
           </div>
@@ -1628,10 +1895,10 @@
         {#if data}
           <div class="vertical-chart daily-chart">
             {#each dailyTrendBuckets as bucket}
-              <div class="chart-column" title={bucket.inRange && hasTrendData(bucket) ? `${bucket.label} ${formatToken(bucket.totalTokens)}` : "无数据"}>
-                <b>{bucket.inRange ? trendValueText(bucket) : "-"}</b>
+              <div class="chart-column" title={bucket.inRange ? `${bucket.label} ${formatToken(bucket.totalTokens)}` : "不在查询范围内"}>
+                <b>{rangedTrendValueText(bucket, bucket.inRange, true)}</b>
                 <div class="chart-track">
-                  <i class={trendClass(bucket)} style={`height:${trendHeight(bucket, dailyPeak)}`}></i>
+                  <i class={bucket.inRange ? trendClass(bucket, dailyPeak) : ""} style={`height:${bucket.inRange ? trendHeight(bucket, dailyPeak) : "0%"}`}></i>
                 </div>
                 <span>{bucket.displayLabel}</span>
               </div>
@@ -1662,8 +1929,9 @@
         </div>
         <div class="top-bars">
           {#if data && data.topProjects.length > 0}
-            {#each data.topProjects as project}
-              <div class={`top-bar-row ${valueToneClass(project.totalTokens, topProjectPeak)}`}>
+            {#each data.topProjects.slice(0, 5) as project, index}
+              <div class={`top-bar-row ${rankToneClass(index)}`}>
+                <em>{index + 1}</em>
                 <span>{project.projectName}</span>
                 <div class="top-bar-track">
                   <i style={`width:${barWidth(project.totalTokens, topProjectPeak)}`}></i>
@@ -1672,8 +1940,9 @@
               </div>
             {/each}
           {:else if initialLoading}
-            {#each Array.from({ length: 6 }) as _, index}
+            {#each Array.from({ length: 5 }) as _, index}
               <div class="top-bar-row skeleton-row">
+                <em aria-hidden="true"></em>
                 <span aria-hidden="true"></span>
                 <div class="top-bar-track">
                   <i style={`width:${index === 0 ? "100%" : `${Math.max(8, 54 - index * 8)}%`}`}></i>
@@ -1705,24 +1974,24 @@
                 </div>
                 <div class="ring-legend">
                   <div class="tone-medium"><i class="blue-bg"></i><span>输入：<b>{percentOf(metrics.inputTokens, metrics.totalTokens)}</b></span></div>
-                  <div class="tone-low"><i class="green-bg"></i><span>输出：<b>{percentOf(outputTotal(metrics), metrics.totalTokens)}</b></span></div>
+                  <div class="tone-cyan"><i class="cyan-bg"></i><span>输出：<b>{percentOf(outputTotal(metrics), metrics.totalTokens)}</b></span></div>
                 </div>
               </div>
 
               <div class="composition-ring-item tone-low">
+                <div class="ring-legend ring-legend-above">
+                  <div class="tone-low"><i class="green-bg"></i><span>缓存输入：<b>{percentOf(metrics.cachedInputTokens, metrics.inputTokens)}</b></span></div>
+                  <div class="tone-high"><i class="orange-bg"></i><span>非缓存输入：<b>{percentOf(metrics.nonCachedInputTokens, metrics.inputTokens)}</b></span></div>
+                </div>
                 <div class="single-ring" style={`--ring:${inputRingStyle(metrics)}`}>
                   <div class="single-ring-center">
                     <span>输入</span>
                     <b>{formatToken(metrics.inputTokens)}</b>
                   </div>
                 </div>
-                <div class="ring-legend">
-                  <div class="tone-low"><i class="green-bg"></i><span>缓存输入：<b>{percentOf(metrics.cachedInputTokens, metrics.inputTokens)}</b></span></div>
-                  <div class="tone-high"><i class="orange-bg"></i><span>非缓存输入：<b>{percentOf(metrics.nonCachedInputTokens, metrics.inputTokens)}</b></span></div>
-                </div>
               </div>
 
-              <div class="composition-ring-item tone-abnormal">
+              <div class="composition-ring-item tone-medium">
                 <div class="single-ring" style={`--ring:${outputRingStyle(metrics)}`}>
                   <div class="single-ring-center">
                     <span>输出</span>
@@ -1730,8 +1999,8 @@
                   </div>
                 </div>
                 <div class="ring-legend">
-                  <div class="tone-abnormal"><i class="red-bg"></i><span>推理输出：<b>{percentOf(metrics.reasoningOutputTokens, outputTotal(metrics))}</b></span></div>
-                  <div class="tone-medium"><i class="blue-bg"></i><span>非推理输出：<b>{percentOf(metrics.outputTokens, outputTotal(metrics))}</b></span></div>
+                  <div class="tone-medium"><i class="blue-bg"></i><span>推理输出：<b>{percentOf(metrics.reasoningOutputTokens, outputTotal(metrics))}</b></span></div>
+                  <div class="tone-high"><i class="orange-bg"></i><span>非推理输出：<b>{percentOf(metrics.outputTokens, outputTotal(metrics))}</b></span></div>
                 </div>
               </div>
             </div>
@@ -1769,7 +2038,6 @@
         <div class="panel-title compact">
           <div>
             <h2>近2周-分时</h2>
-            <p>按每天 0-24 小时展示 token 用量，颜色越深表示消耗越高。</p>
           </div>
           <div class="legend">
             <span class="low">低</span>
@@ -1779,8 +2047,8 @@
           </div>
         </div>
         <div class="heatmap">
-            <div class="hour-labels">
-              {#each [0, 4, 8, 12, 16, 20, 24] as hour}
+          <div class="hour-labels">
+            {#each [0, 4, 8, 12, 16, 20, 24] as hour}
               <span style={`top:${(hour / 24) * 100}%`}>{hour}点</span>
             {/each}
           </div>
@@ -1791,6 +2059,7 @@
             {#if hourlyDays.length > 0}
               {#each hourlyDays as day}
                 <div class="day-column" class:outside-range={!day.inRange}>
+                  <span>{day.inRange ? dayLabel(day.date) : "-"}</span>
                   {#each Array.from({ length: 24 }, (_, index) => index) as hour}
                     {@const bucket = day.inRange ? hourlyMap.get(`${day.date}|${hour}`) : undefined}
                     <div
@@ -1798,7 +2067,6 @@
                       title={day.inRange ? `${day.date} ${hour}:00 ${formatToken(bucket?.totalTokens ?? 0)}` : ""}
                     ></div>
                   {/each}
-                  <span>{day.inRange ? dayLabel(day.date) : "-"}</span>
                 </div>
               {/each}
             {:else}
@@ -1816,9 +2084,11 @@
         </div>
         <div class="top-bars">
           {#if data && data.topSessions.length > 0}
-            {#each data.topSessions as session}
-              <div class={`top-bar-row ${valueToneClass(session.totalTokens, topSessionPeak)}`} title={`${session.sessionName}\n项目：${session.projectName}\nSession ID：${session.sessionId}`}>
-                <span>{session.projectName}/{session.sessionName}</span>
+            {#each data.topSessions.slice(0, 5) as session, index}
+              <div class={`top-bar-row session-top-row ${rankToneClass(index)}`} title={`${session.sessionName}\n项目：${session.projectName}\nSession ID：${session.sessionId}`}>
+                <em>{index + 1}</em>
+                <span class="top-project-name">{session.projectName}</span>
+                <span class="top-session-name">{session.sessionName}</span>
                 <div class="top-bar-track">
                   <i style={`width:${barWidth(session.totalTokens, topSessionPeak)}`}></i>
                 </div>
@@ -1826,8 +2096,9 @@
               </div>
             {/each}
           {:else if initialLoading}
-            {#each Array.from({ length: 6 }) as _, index}
+            {#each Array.from({ length: 5 }) as _, index}
               <div class="top-bar-row skeleton-row">
+                <em aria-hidden="true"></em>
                 <span aria-hidden="true"></span>
                 <div class="top-bar-track">
                   <i style={`width:${index === 0 ? "100%" : `${Math.max(8, 54 - index * 8)}%`}`}></i>
@@ -1854,6 +2125,18 @@
   {/if}
 
   <footer class="status-line">
+    <button
+      type="button"
+      class="status-update-button"
+      class:primary={updateButtonStatus === "ready" || updateButtonStatus === "installing"}
+      on:click={handleUpdateButton}
+      disabled={updateButtonDisabled()}
+    >
+      {updateButtonLabel()}
+    </button>
+    {#if appVersion}
+      <span>版本：{appVersion}</span>
+    {/if}
     <span>账本：{formatCount(data?.scanState.ledgerTokenEvents ?? 0)} 条</span>
     <span>本次新增：{formatCount(data?.scanState.lastRunNewTokenEvents ?? 0)} 条</span>
     <span>扫描文件：{formatCount(data?.scanState.lastRunFilesScanned ?? 0)} 个</span>

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Codex Token Usage">
+  <defs>
+    <linearGradient id="gold" x1="214" y1="152" x2="806" y2="878" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff2a6"/>
+      <stop offset="0.24" stop-color="#facc15"/>
+      <stop offset="0.62" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#b45309"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#gold)">
+    <circle cx="512" cy="512" r="292"/>
+    <circle cx="512" cy="286" r="176"/>
+    <circle cx="692" cy="382" r="176"/>
+    <circle cx="746" cy="570" r="174"/>
+    <circle cx="634" cy="746" r="176"/>
+    <circle cx="420" cy="752" r="176"/>
+    <circle cx="266" cy="578" r="176"/>
+    <circle cx="322" cy="392" r="176"/>
+  </g>
+  <g transform="translate(-38 0)" fill="none" stroke="#fffdf3" stroke-linecap="round" stroke-linejoin="round" stroke-width="56">
+    <path d="m408 374 128 138-128 138"/>
+    <path d="M598 650h132"/>
+  </g>
+</svg>

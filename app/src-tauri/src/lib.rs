@@ -458,31 +458,31 @@ struct SessionContext {
 }
 
 #[tauri::command]
-fn refresh_usage(filters: Option<UsageFilters>) -> Result<DashboardData, String> {
-    let paths = AppPaths::new().map_err(|error| error.to_string())?;
-    let mut conn = open_database(&paths).map_err(|error| error.to_string())?;
-    init_database(&conn).map_err(|error| error.to_string())?;
+async fn refresh_usage(filters: Option<UsageFilters>) -> Result<DashboardData, String> {
+    let filters = filters.unwrap_or_default();
 
-    let config = read_app_config(&conn).map_err(|error| error.to_string())?;
-    let sessions_root = PathBuf::from(&config.sessions_root);
-    let scan_state = match scan_sessions(&mut conn, &sessions_root, config.include_archived) {
-        Ok(state) => state,
-        Err(error) => {
-            let mut state = read_scan_state(&conn, &sessions_root, config.include_archived)
-                .map_err(|e| e.to_string())?;
-            state.error = Some(error.to_string());
-            state
-        }
-    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = AppPaths::new().map_err(|error| error.to_string())?;
+        let mut conn = open_database(&paths).map_err(|error| error.to_string())?;
+        init_database(&conn).map_err(|error| error.to_string())?;
 
-    query_dashboard(
-        &conn,
-        &paths,
-        filters.unwrap_or_default(),
-        config,
-        scan_state,
-    )
-    .map_err(|error| error.to_string())
+        let config = read_app_config(&conn).map_err(|error| error.to_string())?;
+        let sessions_root = PathBuf::from(&config.sessions_root);
+        let scan_state = match scan_sessions(&mut conn, &sessions_root, config.include_archived) {
+            Ok(state) => state,
+            Err(error) => {
+                let mut state = read_scan_state(&conn, &sessions_root, config.include_archived)
+                    .map_err(|e| e.to_string())?;
+                state.error = Some(error.to_string());
+                state
+            }
+        };
+
+        query_dashboard(&conn, &paths, filters, config, scan_state)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("刷新任务执行失败：{error}"))?
 }
 
 #[tauri::command]
