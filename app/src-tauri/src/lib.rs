@@ -654,6 +654,13 @@ fn open_release_page(url: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(windows)]
+            if let Ok(current_exe) = env::current_exe() {
+                if let Err(error) = ensure_desktop_shortcut(&current_exe) {
+                    eprintln!("failed to create desktop shortcut: {error}");
+                }
+            }
+
             let open = MenuItem::with_id(app, "open", "打开窗口", true, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "刷新统计", true, None::<&str>)?;
             let check_update =
@@ -759,6 +766,10 @@ fn install_current_exe_to_stable_entry(
     let current_exe = env::current_exe()?;
     let stable_entry = stable_entry_path()?;
     if paths_refer_to_same_file(&current_exe, &stable_entry) {
+        #[cfg(windows)]
+        if let Err(error) = ensure_desktop_shortcut(&stable_entry) {
+            eprintln!("failed to update desktop shortcut: {error}");
+        }
         return Ok(InstallStableEntryResultDto {
             stable_entry_path: stable_entry.display().to_string(),
             installed: false,
@@ -767,6 +778,10 @@ fn install_current_exe_to_stable_entry(
 
     copy_exe_with_recovery(&current_exe, &stable_entry)?;
     write_stable_marker(&stable_entry)?;
+    #[cfg(windows)]
+    if let Err(error) = ensure_desktop_shortcut(&stable_entry) {
+        eprintln!("failed to update desktop shortcut: {error}");
+    }
     Ok(InstallStableEntryResultDto {
         stable_entry_path: stable_entry.display().to_string(),
         installed: true,
@@ -844,6 +859,40 @@ fn stable_entry_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 fn stable_marker_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(stable_program_dir().join(".stable-entry"))
+}
+
+#[cfg(windows)]
+fn ensure_desktop_shortcut(target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let working_directory = target
+        .parent()
+        .ok_or_else(|| format!("快捷方式目标路径无父目录：{}", target.display()))?;
+    let target_value = target.to_string_lossy().replace('\'', "''");
+    let working_directory_value = working_directory.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory); \
+         New-Item -ItemType Directory -Force -Path $desktop | Out-Null; \
+         $shortcutPath = Join-Path $desktop 'Codex Token Usage.lnk'; \
+         $shell = New-Object -ComObject WScript.Shell; \
+         $shortcut = $shell.CreateShortcut($shortcutPath); \
+         $shortcut.TargetPath = '{target_value}'; \
+         $shortcut.WorkingDirectory = '{working_directory_value}'; \
+         $shortcut.IconLocation = '{target_value},0'; \
+         $shortcut.Description = 'Codex Token Usage'; \
+         $shortcut.Save()"
+    );
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        script.as_str(),
+    ]);
+    spawn_hidden(&mut command)?;
+    Ok(())
 }
 
 fn write_stable_marker(stable_entry: &Path) -> Result<(), Box<dyn std::error::Error>> {
