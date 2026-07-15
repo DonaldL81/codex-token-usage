@@ -145,6 +145,29 @@ pub struct UpdateInfoDto {
     message: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AtomFeed {
+    #[serde(rename = "entry", default)]
+    entries: Vec<AtomEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtomEntry {
+    title: String,
+    updated: Option<String>,
+    #[serde(rename = "link", default)]
+    links: Vec<AtomLink>,
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtomLink {
+    #[serde(rename = "@rel")]
+    rel: Option<String>,
+    #[serde(rename = "@href")]
+    href: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateDownloadProgressDto {
@@ -1098,7 +1121,16 @@ fn check_update_from_source(source: &str) -> Result<UpdateInfoDto, Box<dyn std::
         .timeout(std::time::Duration::from_secs(20))
         .user_agent(format!("{PRODUCT_ASSET_PREFIX}/{}", current_version))
         .build()?;
-    let release: Value = client.get(&api_url).send()?.error_for_status()?.json()?;
+    let response = client.get(&api_url).send()?;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        if response.status() == reqwest::StatusCode::FORBIDDEN
+            || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return check_update_from_atom(&client, &api_url, &current_version);
+        }
+        return Err(response.error_for_status().unwrap_err().into());
+    }
+    let release: Value = response.json()?;
     let tag = get_str(&release, "tag_name").unwrap_or_default();
     let latest_version = normalize_release_version(&tag);
     if latest_version.is_empty() {
@@ -1126,6 +1158,68 @@ fn check_update_from_source(source: &str) -> Result<UpdateInfoDto, Box<dyn std::
         has_update,
         message,
     })
+}
+
+fn check_update_from_atom(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    current_version: &str,
+) -> Result<UpdateInfoDto, Box<dyn std::error::Error>> {
+    let (owner, repo) = github_repository_from_api_url(api_url)
+        .ok_or("备用发布源仅支持 GitHub Latest Release 地址。")?;
+    let feed_url = format!("https://github.com/{owner}/{repo}/releases.atom");
+    let feed_text = client.get(feed_url).send()?.error_for_status()?.text()?;
+    let feed: AtomFeed = quick_xml::de::from_str(&feed_text)?;
+    let entry = feed
+        .entries
+        .first()
+        .ok_or("备用发布源中没有可用的发布记录。")?;
+    let release_page_url = entry
+        .links
+        .iter()
+        .find(|link| link.rel.as_deref() == Some("alternate"))
+        .or_else(|| entry.links.first())
+        .map(|link| link.href.clone())
+        .ok_or("备用发布源中没有发布页面地址。")?;
+    let tag = release_page_url
+        .split("/releases/tag/")
+        .nth(1)
+        .and_then(|value| value.split('/').next())
+        .ok_or("备用发布源中没有发布版本标签。")?
+        .to_string();
+    let latest_version = normalize_release_version(&tag);
+    if latest_version.is_empty() {
+        return Err("备用发布源中没有有效的版本号。".into());
+    }
+    let download_url = format!(
+        "https://github.com/{owner}/{repo}/releases/download/{tag}/{PRODUCT_ASSET_PREFIX}-{latest_version}-windows-x64-portable.exe"
+    );
+    let has_update = is_newer_version(&latest_version, current_version);
+
+    Ok(UpdateInfoDto {
+        current_version: current_version.to_string(),
+        source: api_url.to_string(),
+        latest_version: Some(latest_version),
+        release_name: Some(entry.title.clone()),
+        published_at: entry.updated.clone(),
+        release_notes: entry.content.clone(),
+        download_url: Some(download_url),
+        release_page_url: Some(release_page_url),
+        has_update,
+        message: if has_update {
+            format!("发现新版本 {tag}")
+        } else {
+            format!("当前已是最新版本 {current_version}")
+        },
+    })
+}
+
+fn github_repository_from_api_url(api_url: &str) -> Option<(&str, &str)> {
+    let repository = api_url
+        .strip_prefix("https://api.github.com/repos/")?
+        .strip_suffix("/releases/latest")?;
+    let mut parts = repository.split('/');
+    Some((parts.next()?, parts.next()?))
 }
 
 fn download_update_package_to_cache(
@@ -4104,6 +4198,35 @@ mod tests {
             normalize_update_source("https://github.com/owner/repo").unwrap(),
             "https://api.github.com/repos/owner/repo/releases/latest"
         );
+    }
+
+    #[test]
+    fn github_atom_release_feed_parses_latest_release() {
+        let feed: AtomFeed = quick_xml::de::from_str(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <updated>2026-07-15T07:54:50Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/owner/repo/releases/tag/v1.0.5"/>
+    <title>Codex Token Usage v1.0.5</title>
+    <content type="html">release notes</content>
+  </entry>
+</feed>"#,
+        )
+        .unwrap();
+
+        let entry = feed.entries.first().unwrap();
+        let release_page_url = entry
+            .links
+            .iter()
+            .find(|link| link.rel.as_deref() == Some("alternate"))
+            .unwrap();
+        assert_eq!(
+            release_page_url.href,
+            "https://github.com/owner/repo/releases/tag/v1.0.5"
+        );
+        assert_eq!(normalize_release_version("v1.0.5"), "1.0.5");
+        assert_eq!(entry.content.as_deref(), Some("release notes"));
     }
 
     #[test]

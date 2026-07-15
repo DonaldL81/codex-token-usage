@@ -1294,6 +1294,7 @@ td:last-child {
   color: #64738d;
   font-size: 11px;
   text-align: center;
+  cursor: help;
 }
 
 .chart-column b {
@@ -1337,12 +1338,17 @@ td:last-child {
   width: 100%;
   min-height: 2px;
   border-radius: 6px 6px 0 0;
-  transition: filter 0.16s ease, height 0.24s ease;
+  transform-origin: center bottom;
+  transition: filter 0.16s ease, transform 0.16s ease, height 0.24s ease;
 }
 
-.chart-column:hover .chart-track i,
-.top-bar-row:hover .top-bar-track i {
-  filter: brightness(1.05);
+.chart-column:hover .chart-track {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--data-blue) 18%, transparent);
+}
+
+.chart-column:hover .chart-track i {
+  filter: brightness(1.14) saturate(1.06);
+  transform: scaleY(1.025);
 }
 
 .chart-track .tone-low {
@@ -1469,11 +1475,16 @@ td:last-child {
   min-height: 0;
   border-radius: 3px;
   background: #eef3f9;
-  transition: filter 0.14s ease;
+  cursor: help;
+  transition: filter 0.14s ease, transform 0.14s ease, box-shadow 0.14s ease;
 }
 
 .heat-cell:hover {
-  filter: brightness(1.08);
+  position: relative;
+  z-index: 1;
+  filter: brightness(1.14) saturate(1.06);
+  transform: scale(1.035);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--data-blue) 18%, transparent);
 }
 
 .heat-cell.empty {
@@ -1553,11 +1564,14 @@ td:last-child {
   margin: 0 auto;
   border-radius: 50%;
   background: var(--ring);
-  transition: filter 0.16s ease;
+  cursor: help;
+  transition: filter 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
 }
 
 .composition-ring-item:hover .single-ring {
-  filter: brightness(1.04);
+  filter: brightness(1.1) saturate(1.05);
+  transform: scale(1.025);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--data-blue) 16%, transparent);
 }
 
 .composition-ring-item:not(:first-child) .single-ring {
@@ -1704,6 +1718,7 @@ td:last-child {
   align-items: center;
   color: #64738d;
   font-size: 12px;
+  cursor: help;
 }
 
 .top-bar-row em {
@@ -1739,7 +1754,16 @@ td:last-child {
   height: 100%;
   border-radius: inherit;
   background: var(--tone, var(--chart-blue-medium));
-  transition: filter 0.18s ease, width 0.3s ease;
+  transition: filter 0.18s ease, transform 0.18s ease, width 0.3s ease;
+}
+
+.top-bar-row:hover .top-bar-track {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--data-blue) 18%, transparent);
+}
+
+.top-bar-row:hover .top-bar-track i {
+  filter: brightness(1.14) saturate(1.06);
+  transform: scaleY(1.18);
 }
 
 .top-bar-row b {
