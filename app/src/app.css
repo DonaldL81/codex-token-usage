@@ -933,6 +933,11 @@ nav button.active {
   min-height: 0;
 }
 
+.detail-panel tbody tr {
+  content-visibility: auto;
+  contain-intrinsic-size: 42px;
+}
+
 table {
   width: 100%;
   min-width: 980px;

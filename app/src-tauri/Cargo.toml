@@ -1,6 +1,6 @@
 [package]
 name = "codex-token-usage"
-version = "1.0.5"
+version = "1.0.6"
 description = "Local Codex token usage dashboard"
 authors = ["Codex Token Usage"]
 edition = "2021"

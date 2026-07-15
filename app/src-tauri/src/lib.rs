@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -21,7 +22,6 @@ use tauri::{
 };
 use walkdir::WalkDir;
 
-const LOOKBACK_MINUTES: i64 = 5;
 const HIGH_TOKEN_THRESHOLD: i64 = 200_000;
 const ABNORMAL_TOKEN_THRESHOLD: i64 = 1_000_000;
 const PRECEDING_ACTION_WINDOW_SECONDS: i64 = 60;
@@ -39,6 +39,7 @@ pub struct UsageFilters {
     session: Option<String>,
     search: Option<String>,
     only_anomalies: Option<bool>,
+    include_details: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +62,16 @@ pub struct DashboardData {
     top_projects: Vec<TopProjectDto>,
     project_options: Vec<FilterOptionDto>,
     session_options: Vec<FilterOptionDto>,
+    details_loaded: bool,
+    performance_timings: PerformanceTimingsDto,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformanceTimingsDto {
+    query_ms: u64,
+    assembly_ms: u64,
+    total_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,23 +521,22 @@ async fn refresh_usage(filters: Option<UsageFilters>) -> Result<DashboardData, S
 }
 
 #[tauri::command]
-fn query_usage(filters: Option<UsageFilters>) -> Result<DashboardData, String> {
-    let paths = AppPaths::new().map_err(|error| error.to_string())?;
-    let conn = open_database(&paths).map_err(|error| error.to_string())?;
-    init_database(&conn).map_err(|error| error.to_string())?;
-    let config = read_app_config(&conn).map_err(|error| error.to_string())?;
-    let sessions_root = PathBuf::from(&config.sessions_root);
-    let scan_state = read_scan_state(&conn, &sessions_root, config.include_archived)
-        .map_err(|error| error.to_string())?;
+async fn query_usage(filters: Option<UsageFilters>) -> Result<DashboardData, String> {
+    let filters = filters.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = AppPaths::new().map_err(|error| error.to_string())?;
+        let conn = open_database(&paths).map_err(|error| error.to_string())?;
+        init_database(&conn).map_err(|error| error.to_string())?;
+        let config = read_app_config(&conn).map_err(|error| error.to_string())?;
+        let sessions_root = PathBuf::from(&config.sessions_root);
+        let scan_state = read_scan_state(&conn, &sessions_root, config.include_archived)
+            .map_err(|error| error.to_string())?;
 
-    query_dashboard(
-        &conn,
-        &paths,
-        filters.unwrap_or_default(),
-        config,
-        scan_state,
-    )
-    .map_err(|error| error.to_string())
+        query_dashboard(&conn, &paths, filters, config, scan_state)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("查询任务执行失败：{error}"))?
 }
 
 #[tauri::command]
@@ -561,6 +571,8 @@ fn rebuild_ledger() -> Result<RebuildResultDto, String> {
     conn.execute("DELETE FROM token_context_actions", [])
         .map_err(|error| error.to_string())?;
     conn.execute("DELETE FROM context_action_backfill_state", [])
+        .map_err(|error| error.to_string())?;
+    conn.execute("DELETE FROM source_file_manifest", [])
         .map_err(|error| error.to_string())?;
     conn.execute("DELETE FROM scan_state", [])
         .map_err(|error| error.to_string())?;
@@ -615,27 +627,35 @@ fn apply_retention_policy() -> Result<RetentionResultDto, String> {
 }
 
 #[tauri::command]
-fn check_update(source: Option<String>) -> Result<UpdateInfoDto, String> {
-    let update_source = match source.map(|value| value.trim().to_string()) {
-        Some(value) if !value.is_empty() => value,
-        _ => {
-            let paths = AppPaths::new().map_err(|error| error.to_string())?;
-            let conn = open_database(&paths).map_err(|error| error.to_string())?;
-            init_database(&conn).map_err(|error| error.to_string())?;
-            read_app_config(&conn)
-                .map_err(|error| error.to_string())?
-                .update_source
-        }
-    };
-    check_update_from_source(&update_source).map_err(|error| error.to_string())
+async fn check_update(source: Option<String>) -> Result<UpdateInfoDto, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let update_source = match source.map(|value| value.trim().to_string()) {
+            Some(value) if !value.is_empty() => value,
+            _ => {
+                let paths = AppPaths::new().map_err(|error| error.to_string())?;
+                let conn = open_database(&paths).map_err(|error| error.to_string())?;
+                init_database(&conn).map_err(|error| error.to_string())?;
+                read_app_config(&conn)
+                    .map_err(|error| error.to_string())?
+                    .update_source
+            }
+        };
+        check_update_from_source(&update_source).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("检查更新任务执行失败：{error}"))?
 }
 
 #[tauri::command]
-fn download_update_package(
+async fn download_update_package(
     app: tauri::AppHandle,
     input: DownloadUpdateInput,
 ) -> Result<DownloadUpdateResultDto, String> {
-    download_update_package_to_cache(&app, input).map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        download_update_package_to_cache(&app, input).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("下载更新任务执行失败：{error}"))?
 }
 
 #[tauri::command]
@@ -644,8 +664,12 @@ fn get_update_runtime_info() -> Result<UpdateRuntimeInfoDto, String> {
 }
 
 #[tauri::command]
-fn install_stable_entry() -> Result<InstallStableEntryResultDto, String> {
-    install_current_exe_to_stable_entry().map_err(|error| error.to_string())
+async fn install_stable_entry() -> Result<InstallStableEntryResultDto, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        install_current_exe_to_stable_entry().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("稳定入口任务执行失败：{error}"))?
 }
 
 #[tauri::command]
@@ -1730,6 +1754,13 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
             completed_utc TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS source_file_manifest (
+            file_path TEXT PRIMARY KEY,
+            modified_utc TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            scanned_utc TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_token_events_date ON token_events(date);
         CREATE INDEX IF NOT EXISTS idx_token_events_project ON token_events(project);
         CREATE INDEX IF NOT EXISTS idx_token_events_session ON token_events(session_id);
@@ -1754,7 +1785,8 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
         "app_config",
         "update_source",
         "TEXT NOT NULL DEFAULT ''",
-    )
+    )?;
+    seed_source_file_manifest(conn)
 }
 
 fn ensure_column(
@@ -1776,6 +1808,54 @@ fn ensure_column(
     Ok(())
 }
 
+fn seed_source_file_manifest(conn: &Connection) -> rusqlite::Result<()> {
+    let manifest_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM source_file_manifest", [], |row| {
+            row.get(0)
+        })?;
+    if manifest_count > 0 {
+        return Ok(());
+    }
+
+    let last_run_utc: Option<String> = conn
+        .query_row(
+            "SELECT last_run_utc FROM scan_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let last_run = last_run_utc.as_deref().and_then(parse_codex_time);
+    let mut statement = conn.prepare("SELECT DISTINCT file_path FROM token_events")?;
+    let file_paths = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let now = format_utc_iso(Utc::now());
+
+    for file_path in file_paths {
+        let path = Path::new(&file_path);
+        let Ok(metadata) = fs::metadata(path) else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let modified_utc: DateTime<Utc> = modified.into();
+        if last_run.is_some_and(|last| modified_utc > last) {
+            continue;
+        }
+        conn.execute(
+            r#"
+            INSERT OR IGNORE INTO source_file_manifest (file_path, modified_utc, file_size, scanned_utc)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![file_path, format_utc_iso(modified_utc), metadata.len() as i64, last_run_utc.as_deref().unwrap_or(&now)],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn scan_sessions(
     conn: &mut Connection,
     sessions_root: &Path,
@@ -1790,7 +1870,7 @@ fn scan_sessions(
     }
 
     let previous_cutoff = read_last_cutoff(conn)?;
-    let scan_cutoff = previous_cutoff.map(|cutoff| cutoff - Duration::minutes(LOOKBACK_MINUTES));
+    let manifest = load_source_file_manifest(conn)?;
     let mut files_scanned = 0_i64;
     let mut new_events = 0_i64;
     let mut parse_errors = 0_i64;
@@ -1805,15 +1885,14 @@ fn scan_sessions(
             if entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(cutoff) = scan_cutoff {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        let modified_utc: DateTime<Utc> = modified.into();
-                        if modified_utc < cutoff {
-                            continue;
-                        }
-                    }
-                }
+            let metadata = entry.metadata()?;
+            let modified_utc: DateTime<Utc> = metadata.modified()?.into();
+            let file_path = entry.path().display().to_string();
+            let modified_text = format_utc_iso(modified_utc);
+            if manifest.get(&file_path).is_some_and(|fingerprint| {
+                fingerprint.modified_utc == modified_text && fingerprint.file_size == metadata.len()
+            }) {
+                continue;
             }
 
             files_scanned += 1;
@@ -1829,6 +1908,22 @@ fn scan_sessions(
             for action in &parsed_file.context_actions {
                 insert_context_action(&tx, action)?;
             }
+            tx.execute(
+                r#"
+                INSERT INTO source_file_manifest (file_path, modified_utc, file_size, scanned_utc)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(file_path) DO UPDATE SET
+                    modified_utc = excluded.modified_utc,
+                    file_size = excluded.file_size,
+                    scanned_utc = excluded.scanned_utc
+                "#,
+                params![
+                    file_path,
+                    modified_text,
+                    metadata.len() as i64,
+                    format_utc_iso(Utc::now())
+                ],
+            )?;
         }
     }
 
@@ -1875,6 +1970,29 @@ fn scan_sessions(
     )?;
 
     read_scan_state(conn, sessions_root, include_archived).map_err(Into::into)
+}
+
+#[derive(Debug, Clone)]
+struct SourceFileFingerprint {
+    modified_utc: String,
+    file_size: u64,
+}
+
+fn load_source_file_manifest(
+    conn: &Connection,
+) -> rusqlite::Result<HashMap<String, SourceFileFingerprint>> {
+    let mut statement =
+        conn.prepare("SELECT file_path, modified_utc, file_size FROM source_file_manifest")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            SourceFileFingerprint {
+                modified_utc: row.get(1)?,
+                file_size: row.get::<_, i64>(2)?.max(0) as u64,
+            },
+        ))
+    })?;
+    rows.collect()
 }
 
 fn scan_roots(sessions_root: &Path, include_archived: bool) -> Vec<PathBuf> {
@@ -2540,6 +2658,8 @@ fn query_dashboard(
     config: AppConfigDto,
     scan_state: ScanStateDto,
 ) -> rusqlite::Result<DashboardData> {
+    let total_started = Instant::now();
+    let query_started = Instant::now();
     let all_events = load_events(conn)?;
     let display_names = load_display_name_maps(&scan_state.sessions_root);
     let filtered_events = apply_filters(&all_events, &filters, &display_names);
@@ -2549,6 +2669,21 @@ fn query_dashboard(
         &display_names,
     );
     let metrics = build_metrics(&filtered_events);
+    let query_ms = query_started.elapsed().as_millis() as u64;
+    let include_details = filters.include_details.unwrap_or(true);
+    let assembly_started = Instant::now();
+    let detail_rows = if include_details {
+        build_detail_rows(&filtered_events, usize::MAX, &display_names)
+    } else {
+        Vec::new()
+    };
+    let summary_rows = if include_details {
+        build_summary_rows(&filtered_events, usize::MAX)
+    } else {
+        Vec::new()
+    };
+    let assembly_ms = assembly_started.elapsed().as_millis() as u64;
+    let total_ms = total_started.elapsed().as_millis() as u64;
 
     Ok(DashboardData {
         generated_at: format_utc_iso(Utc::now()),
@@ -2558,8 +2693,8 @@ fn query_dashboard(
         config,
         scan_state,
         metrics,
-        detail_rows: build_detail_rows(&filtered_events, usize::MAX, &display_names),
-        summary_rows: build_summary_rows(&filtered_events, usize::MAX),
+        detail_rows,
+        summary_rows,
         daily_buckets: build_daily_buckets(&filtered_events),
         monthly_buckets: build_recent_monthly_buckets(&monthly_events, &filters, 6),
         hourly_buckets: build_hourly_buckets(&filtered_events),
@@ -2568,6 +2703,12 @@ fn query_dashboard(
         top_projects: build_top_projects(&filtered_events, 6, &display_names),
         project_options: build_project_options(&all_events, &display_names),
         session_options: build_session_options(&all_events, &display_names),
+        details_loaded: include_details,
+        performance_timings: PerformanceTimingsDto {
+            query_ms,
+            assembly_ms,
+            total_ms,
+        },
     })
 }
 
@@ -4157,6 +4298,24 @@ mod tests {
         assert!(state.include_archived);
         assert_eq!(state.last_run_files_scanned, 2);
         assert_eq!(state.ledger_token_events, 4);
+    }
+
+    #[test]
+    fn scanner_skips_unchanged_files_after_the_first_scan() {
+        let temp = tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        fs::write(sessions_root.join("sample-session.jsonl"), sample_jsonl()).unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+
+        let first = scan_sessions(&mut conn, &sessions_root, false).unwrap();
+        let second = scan_sessions(&mut conn, &sessions_root, false).unwrap();
+
+        assert_eq!(first.last_run_files_scanned, 1);
+        assert_eq!(second.last_run_files_scanned, 0);
+        assert_eq!(second.ledger_token_events, first.ledger_token_events);
     }
 
     #[test]

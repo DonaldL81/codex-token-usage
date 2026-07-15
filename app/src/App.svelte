@@ -18,6 +18,13 @@
     onlyAnomalies: boolean;
   };
 
+  type LoadDashboardOptions = {
+    preserveView: boolean;
+    filters: UsageFilters;
+    includeDetails?: boolean;
+    background?: boolean;
+  };
+
   type ScanState = {
     lastCutoffUtc: string | null;
     lastRunUtc: string | null;
@@ -260,6 +267,12 @@
     topProjects: TopProject[];
     projectOptions: FilterOption[];
     sessionOptions: FilterOption[];
+    detailsLoaded: boolean;
+    performanceTimings: {
+      queryMs: number;
+      assemblyMs: number;
+      totalMs: number;
+    };
   };
 
   function todayLocalDate(): string {
@@ -296,6 +309,9 @@
   };
   let data: DashboardData | null = null;
   let loading = false;
+  let syncing = false;
+  let refreshPromise: Promise<void> | null = null;
+  let syncStatusMessage = "";
   let error = "";
   let showDateRangePicker = false;
   let calendarBaseMonth = startOfMonth(parseDateValue(defaultFilters().dateFrom) ?? new Date());
@@ -347,6 +363,7 @@
     "超高行"
   ];
   const DEFAULT_UPDATE_SOURCE = "DonaldL81/codex-token-usage";
+  const DASHBOARD_CACHE_KEY = "codex-token-usage-dashboard-cache";
   const monitorStartedAt = new Date();
 
   $: metrics = data?.metrics;
@@ -403,7 +420,7 @@
         appVersion = "";
       });
     restoreUiState();
-    refreshUsage();
+    void bootstrapUsage();
     listen("tray-refresh", () => refreshUsage())
       .then((unlisten) => {
         trayUnlisten = unlisten;
@@ -434,20 +451,49 @@
     cancelTooltipHide();
   });
 
-  async function refreshUsage() {
-    if (loading) {
+  async function bootstrapUsage() {
+    const cached = restoreDashboardCache();
+    if (cached) {
+      data = cached;
+      syncSettingsDrafts(normalizeConfig(cached.config));
+      settings = normalizeConfig(cached.config);
+      syncStatusMessage = "正在后台同步本机日志...";
+      void refreshUsage({ background: true });
       return;
+    }
+    await refreshUsage();
+  }
+
+  async function refreshUsage(options: { background?: boolean } = {}) {
+    if (refreshPromise) {
+      return refreshPromise;
     }
     normalizeDateRange();
     syncDateRangeDraft();
     showDateRangePicker = false;
-    await loadDashboard("refresh_usage", { preserveView: true, filters });
+    const promise = loadDashboard("refresh_usage", {
+      preserveView: true,
+      filters,
+      includeDetails: activePage !== "stats",
+      background: options.background ?? false
+    }).finally(() => {
+      refreshPromise = null;
+      if (!syncing) {
+        syncStatusMessage = "";
+      }
+    });
+    refreshPromise = promise;
+    return promise;
   }
 
   async function applyFilters() {
     normalizeDateRange();
     showDateRangePicker = false;
-    await loadDashboard("query_usage", { preserveView: false, filters });
+    await loadDashboard("query_usage", {
+      preserveView: false,
+      filters,
+      includeDetails: activePage !== "stats"
+    });
   }
 
   async function autoApplyFilters(nextFilters: UsageFilters) {
@@ -457,18 +503,24 @@
     showDateRangePicker = false;
     await loadDashboard("query_usage", {
       preserveView: false,
-      filters: { ...filters, search: appliedFilters.search }
+      filters: { ...filters, search: appliedFilters.search },
+      includeDetails: activePage !== "stats"
     });
   }
 
   async function loadDashboard(
     command: "refresh_usage" | "query_usage",
-    options: { preserveView: boolean; filters: UsageFilters }
+    options: LoadDashboardOptions
   ) {
-    loading = true;
+    loading = !options.background;
+    syncing = Boolean(options.background);
     error = "";
     const snapshot = options.preserveView ? captureViewSnapshot() : null;
-    const requestFilters = { ...options.filters, onlyAnomalies: false };
+    const requestFilters = {
+      ...options.filters,
+      onlyAnomalies: false,
+      includeDetails: options.includeDetails ?? activePage !== "stats"
+    };
     try {
       const nextData = await invoke<DashboardData>(command, {
         filters: requestFilters
@@ -479,10 +531,13 @@
           ? changedDetailRows(data.detailRows, nextData.detailRows)
           : new Set<string>();
       updatedDetailRows = changedRows;
-      if (canCompareRows) {
-        monitorUserInputKeys = collectMonitorUserInputKeys(monitorUserInputKeys, changedRows, nextData.detailRows);
-      }
+  if (canCompareRows) {
+    monitorUserInputKeys = collectMonitorUserInputKeys(monitorUserInputKeys, changedRows, nextData.detailRows);
+  }
       data = nextData;
+      if (!nextData.detailsLoaded) {
+        saveDashboardCache(nextData);
+      }
       appliedFilters = requestFilters;
       if (snapshot) {
         await restoreViewSnapshot(snapshot, nextData);
@@ -493,13 +548,16 @@
       settings = normalizeConfig(nextData.config);
       syncSettingsDrafts(settings);
       setupRefreshTimer(settings.refreshIntervalSeconds);
-      maybeAutoCheckUpdate();
-      ensureStableEntry();
+      setTimeout(() => {
+        void maybeAutoCheckUpdate();
+        void ensureStableEntry();
+      }, 0);
       saveUiState();
     } catch (unknownError) {
       error = unknownError instanceof Error ? unknownError.message : String(unknownError);
     } finally {
       loading = false;
+      syncing = false;
     }
   }
 
@@ -813,7 +871,14 @@
   function setPage(page: Page) {
     activePage = page;
     saveUiState();
+  if (page !== "stats" && data && !data.detailsLoaded) {
+    void loadDashboard("query_usage", {
+      preserveView: false,
+      filters: appliedFilters,
+      includeDetails: true
+    });
   }
+}
 
   function toggleDateRangePicker() {
     showDateRangePicker = !showDateRangePicker;
@@ -1077,6 +1142,38 @@
     } catch {
       filters = defaultFilters();
       appliedFilters = { ...filters };
+    }
+  }
+
+  function restoreDashboardCache(): DashboardData | null {
+    try {
+      const raw = localStorage.getItem(DASHBOARD_CACHE_KEY);
+      if (!raw) return null;
+      const cached = JSON.parse(raw) as DashboardData;
+      if (!cached || !cached.metrics || !cached.config || !cached.scanState) return null;
+      return {
+        ...cached,
+        detailRows: [],
+        summaryRows: [],
+        detailsLoaded: false,
+        performanceTimings: cached.performanceTimings ?? { queryMs: 0, assemblyMs: 0, totalMs: 0 }
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function saveDashboardCache(nextData: DashboardData) {
+    try {
+      const cached = {
+        ...nextData,
+        detailRows: [],
+        summaryRows: [],
+        detailsLoaded: false
+      };
+      localStorage.setItem(DASHBOARD_CACHE_KEY, JSON.stringify(cached));
+    } catch {
+      // Cache is an optional startup optimization.
     }
   }
 
@@ -1769,12 +1866,12 @@
       <button class="ghost" on:click={resetFilters} disabled={loading}>重置</button>
       <button
         class="primary"
-        class:is-loading={loading}
-        aria-busy={loading ? "true" : "false"}
-        on:click={refreshUsage}
+        class:is-loading={loading || syncing}
+        aria-busy={loading || syncing ? "true" : "false"}
+        on:click={() => refreshUsage()}
         disabled={loading}
       >
-        {loading ? "刷新中" : "刷新"}
+        {loading || syncing ? "同步中" : "刷新"}
       </button>
     </section>
   </section>
@@ -2334,6 +2431,11 @@
       <span class={`update-result ${updateButtonStatus}`} role="status" aria-live="polite" title={updateResultMessage}>
         {updateResultMessage}
       </span>
+    {/if}
+    {#if syncStatusMessage}
+      <span role="status" aria-live="polite">{syncStatusMessage}</span>
+    {:else if data?.performanceTimings?.totalMs}
+      <span>查询耗时：{data.performanceTimings.totalMs} ms</span>
     {/if}
     {#if appVersion}
       <span>版本：{appVersion}</span>
