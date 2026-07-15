@@ -14,6 +14,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     Emitter, Manager, WindowEvent,
@@ -667,14 +668,13 @@ pub fn run() {
                 MenuItem::with_id(app, "check_update", "检查更新", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &refresh, &check_update, &quit])?;
-            let mut tray = TrayIconBuilder::with_id("main")
+            let tray_icon = Image::from_bytes(include_bytes!("../icons/tray-icon-24.png"))?;
+            TrayIconBuilder::with_id("main")
+                .icon(tray_icon)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
-                .tooltip("Codex Token Usage");
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
-            tray.build(app)?;
+                .tooltip("Codex Token Usage")
+                .build(app)?;
             Ok(())
         })
         .on_menu_event(|app, event| match event.id().as_ref() {

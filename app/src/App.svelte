@@ -306,6 +306,7 @@
   let updateRuntimeInfo: UpdateRuntimeInfo | null = null;
   let updateButtonStatus: "idle" | "checking" | "latest" | "ready" | "downloading" | "installing" | "failed" =
     "idle";
+  let updateResultMessage = "";
   let updateStatusTimer: ReturnType<typeof setTimeout> | null = null;
   let editingSessionsRoot = false;
   let draftSessionsRoot = settings.sessionsRoot;
@@ -892,30 +893,41 @@
       return;
     }
     const autoInstall = options.autoInstall ?? true;
+    updateResultMessage = "正在检查更新...";
     setUpdateButtonStatus("checking");
     error = "";
     try {
       updateInfo = await invoke<UpdateInfo>("check_update", { source: DEFAULT_UPDATE_SOURCE });
       if (updateInfo.hasUpdate && updateInfo.downloadUrl) {
+        updateResultMessage = `发现新版本 v${updateInfo.latestVersion ?? ""}，正在自动下载并安装...`;
         if (autoInstall) {
           await installAvailableUpdate();
         } else {
+          updateResultMessage = `发现新版本 v${updateInfo.latestVersion ?? ""}，点击“立即更新”开始安装。`;
           setUpdateButtonStatus("ready");
         }
       } else if (updateInfo.hasUpdate) {
+        updateResultMessage = `发现新版本 v${updateInfo.latestVersion ?? ""}，但暂无可用安装包。`;
         setTemporaryUpdateStatus("failed");
       } else {
+        updateResultMessage = `当前已是最新版本 v${updateInfo.currentVersion}。`;
         setTemporaryUpdateStatus("latest");
       }
     } catch {
       updateInfo = null;
+      updateResultMessage = "检查更新失败，请检查网络连接或更新源后重试。";
       setTemporaryUpdateStatus("failed");
     }
   }
 
   async function installAvailableUpdate() {
-    if (!updateInfo?.downloadUrl) return;
+    if (!updateInfo?.downloadUrl) {
+      updateResultMessage = "没有可用的更新安装包。";
+      setTemporaryUpdateStatus("failed");
+      return;
+    }
     setUpdateButtonStatus("downloading");
+    updateResultMessage = `正在下载 v${updateInfo.latestVersion ?? "新版本"}...`;
     error = "";
     try {
       const result = await invoke<DownloadUpdateResult>("download_update_package", {
@@ -925,10 +937,12 @@
         }
       });
       setUpdateButtonStatus("installing");
+      updateResultMessage = "下载完成，正在安装更新，软件即将重启...";
       await invoke<InstallDownloadedUpdateResult>("install_downloaded_update", {
         input: { packagePath: result.path }
       });
     } catch {
+      updateResultMessage = "更新失败，下载或安装未完成，请稍后重试。";
       setTemporaryUpdateStatus("failed");
     }
   }
@@ -1753,7 +1767,13 @@
         </div>
       </label>
       <button class="ghost" on:click={resetFilters} disabled={loading}>重置</button>
-      <button class="primary" on:click={refreshUsage} disabled={loading}>
+      <button
+        class="primary"
+        class:is-loading={loading}
+        aria-busy={loading ? "true" : "false"}
+        on:click={refreshUsage}
+        disabled={loading}
+      >
         {loading ? "刷新中" : "刷新"}
       </button>
     </section>
@@ -1809,7 +1829,7 @@
     {@const detailTableRows = activePage === "monitor" ? monitorRows : visibleDetailRows}
     {@const detailTotalRows = activePage === "monitor" ? monitorRows.length : data?.detailRows.length ?? 0}
     {@const isMonitorPage = activePage === "monitor"}
-    <section class="panel detail-panel">
+    <section class="panel detail-panel page-enter">
       <div class="panel-title detail-title">
         <div class="detail-controls-row">
           {#if isMonitorPage}
@@ -2039,7 +2059,7 @@
       </div>
     </section>
   {:else}
-    <section class="stats-layout" class:initial-loading={initialLoading}>
+    <section class="stats-layout page-enter" class:initial-loading={initialLoading}>
       <section class="trend-card month-trend-panel">
         <h3>近6月-趋势</h3>
         {#if data && monthlyTrendBuckets.length > 0}
@@ -2306,9 +2326,15 @@
       class:primary={updateButtonStatus === "ready" || updateButtonStatus === "installing"}
       on:click={handleUpdateButton}
       disabled={updateButtonDisabled()}
+      title={updateResultMessage || updateButtonLabel()}
     >
       {updateButtonLabel()}
     </button>
+    {#if updateResultMessage}
+      <span class={`update-result ${updateButtonStatus}`} role="status" aria-live="polite" title={updateResultMessage}>
+        {updateResultMessage}
+      </span>
+    {/if}
     {#if appVersion}
       <span>版本：{appVersion}</span>
     {/if}

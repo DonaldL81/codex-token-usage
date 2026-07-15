@@ -84,6 +84,12 @@ button {
   cursor: pointer;
   height: 36px;
   padding: 0 16px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+}
+
+button:not(:disabled):hover {
+  border-color: #9bbcf4;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.08);
 }
 
 button:disabled {
@@ -96,6 +102,27 @@ button.primary {
   border-color: var(--data-blue);
   background: var(--data-blue);
   color: #fff;
+}
+
+button.primary:not(:disabled):hover {
+  filter: brightness(1.04);
+}
+
+button.primary.is-loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+button.primary.is-loading::before {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.42);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  content: "";
+  animation: spin 0.72s linear infinite;
 }
 
 button.ghost {
@@ -465,6 +492,14 @@ nav button.active {
   border: 1px solid #cfdaea;
   border-radius: 8px;
   background: #fff;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.metric-grid article:hover,
+.panel:hover,
+.trend-card:hover {
+  border-color: #b8ccef;
+  box-shadow: 0 4px 14px rgba(22, 32, 51, 0.06);
 }
 
 .metric-grid span {
@@ -1302,6 +1337,12 @@ td:last-child {
   width: 100%;
   min-height: 2px;
   border-radius: 6px 6px 0 0;
+  transition: filter 0.16s ease, height 0.24s ease;
+}
+
+.chart-column:hover .chart-track i,
+.top-bar-row:hover .top-bar-track i {
+  filter: brightness(1.05);
 }
 
 .chart-track .tone-low {
@@ -1428,6 +1469,11 @@ td:last-child {
   min-height: 0;
   border-radius: 3px;
   background: #eef3f9;
+  transition: filter 0.14s ease;
+}
+
+.heat-cell:hover {
+  filter: brightness(1.08);
 }
 
 .heat-cell.empty {
@@ -1507,6 +1553,11 @@ td:last-child {
   margin: 0 auto;
   border-radius: 50%;
   background: var(--ring);
+  transition: filter 0.16s ease;
+}
+
+.composition-ring-item:hover .single-ring {
+  filter: brightness(1.04);
 }
 
 .composition-ring-item:not(:first-child) .single-ring {
@@ -1688,6 +1739,7 @@ td:last-child {
   height: 100%;
   border-radius: inherit;
   background: var(--tone, var(--chart-blue-medium));
+  transition: filter 0.18s ease, width 0.3s ease;
 }
 
 .top-bar-row b {
@@ -1808,6 +1860,35 @@ td:last-child {
   background: rgba(255, 255, 255, 0.95);
   color: #64738d;
   font-size: 12px;
+  overflow: hidden;
+}
+
+.status-line > span {
+  white-space: nowrap;
+}
+
+.update-result {
+  min-width: 0;
+  max-width: min(520px, 38vw);
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: #64738d;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-result.latest {
+  color: var(--data-green);
+}
+
+.update-result.failed {
+  color: var(--data-red);
+}
+
+.update-result.downloading,
+.update-result.installing,
+.update-result.checking {
+  color: var(--data-blue);
 }
 
 .status-update-button {
@@ -1818,4 +1899,37 @@ td:last-child {
 
 .status-update-button.primary {
   min-width: 0;
+}
+
+.page-enter {
+  animation: page-enter 0.18s ease-out both;
+}
+
+@keyframes page-enter {
+  from {
+    opacity: 0.86;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
