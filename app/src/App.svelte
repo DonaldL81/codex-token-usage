@@ -332,6 +332,8 @@
     "idle";
   let updateResultMessage = "";
   let updateDownloadProgress: UpdateDownloadProgress | null = null;
+  let updateButtonText = "检查更新";
+  let updateButtonIsDisabled = false;
   let editingSessionsRoot = false;
   let draftSessionsRoot = settings.sessionsRoot;
   let editingRefreshInterval = false;
@@ -398,6 +400,15 @@
   $: monthlyPeak = Math.max(...monthlyTrendBuckets.filter((bucket) => bucket.inRange).map((bucket) => bucket.totalTokens), 0);
   $: topProjectPeak = Math.max(...(data?.topProjects ?? []).map((project) => project.totalTokens), 0);
   $: topSessionPeak = Math.max(...(data?.topSessions ?? []).map((session) => session.totalTokens), 0);
+  $: updateButtonText = updateButtonLabel(
+    updateButtonStatus,
+    updateResultMessage,
+    updateDownloadProgress,
+    updateInfo,
+    appVersion
+  );
+  $: updateButtonIsDisabled =
+    loading || updateButtonStatus === "checking" || updateButtonStatus === "downloading" || updateButtonStatus === "installing";
   $: calendarMonths = [
     buildCalendarMonth(calendarBaseMonth, draftDateFrom, draftDateTo),
     buildCalendarMonth(addMonths(calendarBaseMonth, 1), draftDateFrom, draftDateTo)
@@ -1099,10 +1110,16 @@
     setUpdateButtonStatus(status);
   }
 
-  function updateButtonLabel(): string {
-    if (updateButtonStatus === "downloading") {
-      const progress = updateDownloadProgress;
-      const version = updateInfo?.latestVersion ? ` v${updateInfo.latestVersion}` : "";
+  function updateButtonLabel(
+    status: typeof updateButtonStatus,
+    resultMessage: string,
+    downloadProgress: UpdateDownloadProgress | null,
+    info: UpdateInfo | null,
+    versionValue: string
+  ): string {
+    if (status === "downloading") {
+      const progress = downloadProgress;
+      const version = info?.latestVersion ? ` v${info.latestVersion}` : "";
       if (progress?.totalBytes && progress.totalBytes > 0) {
         return `下载${version} ${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`;
       }
@@ -1111,28 +1128,24 @@
       }
       return `下载中${version}`;
     }
-    if (updateButtonStatus === "failed") {
-      return updateResultMessage.startsWith("检查更新失败") ? "检查失败" : "更新失败";
+    if (status === "failed") {
+      return resultMessage.startsWith("检查更新失败") ? "检查失败" : "更新失败";
     }
-    if (updateButtonStatus === "latest") {
-      const version = updateInfo?.currentVersion || appVersion;
+    if (status === "latest") {
+      const version = info?.currentVersion || versionValue;
       return version ? `已是最新 v${version}` : "已是最新";
     }
-    if (updateButtonStatus === "ready") {
-      return updateInfo?.latestVersion ? `立即更新 v${updateInfo.latestVersion}` : "立即更新";
+    if (status === "ready") {
+      return info?.latestVersion ? `立即更新 v${info.latestVersion}` : "立即更新";
     }
-    const labels: Record<Exclude<typeof updateButtonStatus, "downloading" | "failed">, string> = {
+    const labels: Record<Exclude<typeof status, "downloading" | "failed">, string> = {
       idle: "检查更新",
       checking: "检查中...",
       latest: "",
       ready: "",
       installing: "安装中..."
     };
-    return labels[updateButtonStatus];
-  }
-
-  function updateButtonDisabled(): boolean {
-    return loading || updateButtonStatus === "checking" || updateButtonStatus === "downloading" || updateButtonStatus === "installing";
+    return labels[status];
   }
 
   async function handleUpdateButton() {
@@ -2494,11 +2507,11 @@
       class:failed={updateButtonStatus === "failed"}
       class:progress={updateButtonStatus === "checking" || updateButtonStatus === "downloading" || updateButtonStatus === "installing"}
       on:click={handleUpdateButton}
-      disabled={updateButtonDisabled()}
-      title={updateResultMessage || updateButtonLabel()}
+      disabled={updateButtonIsDisabled}
+      title={updateResultMessage || updateButtonText}
       aria-live="polite"
     >
-      {updateButtonLabel()}
+      {updateButtonText}
     </button>
     {#if syncStatusMessage}
       <span role="status" aria-live="polite">{syncStatusMessage}</span>
