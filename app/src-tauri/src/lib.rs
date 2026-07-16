@@ -702,6 +702,10 @@ fn open_release_page(url: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.maximize()?;
+            }
+
             #[cfg(windows)]
             if let Ok(current_exe) = env::current_exe() {
                 if let Err(error) = ensure_desktop_shortcut(&current_exe) {
@@ -3144,7 +3148,9 @@ fn build_metrics(events: &[TokenEvent]) -> MetricsDto {
     let abnormal_count = events
         .iter()
         .filter(|event| is_super_high_status(&event.status))
-        .count();
+        .map(|event| (event.session_id.as_str(), event.turn_id.as_str()))
+        .collect::<BTreeSet<_>>()
+        .len();
     let dates = events
         .iter()
         .map(|event| event.date.as_str())
@@ -4230,6 +4236,21 @@ mod tests {
     }
 
     #[test]
+    fn metrics_count_super_high_turns_instead_of_event_rows() {
+        let mut first = metric_event("session-a", "turn-a", "超高");
+        let mut same_turn = first.clone();
+        same_turn._event_key = "event-2".to_string();
+        same_turn.token_event_index = 2;
+        let second_turn = metric_event("session-a", "turn-b", "异常");
+        let normal_turn = metric_event("session-b", "turn-c", "正常");
+
+        first.user_message_preview = "第一轮".to_string();
+        let metrics = build_metrics(&[first, same_turn, second_turn, normal_turn]);
+
+        assert_eq!(metrics.abnormal_count, 2);
+    }
+
+    #[test]
     fn parser_falls_back_when_session_meta_and_turn_id_are_missing() {
         let temp = tempdir().unwrap();
         let file_path = temp.path().join("fallback-session.jsonl");
@@ -4598,6 +4619,31 @@ mod tests {
 
         assert_eq!(dashboard.metrics.token_event_count, 2);
         assert_eq!(dates.len(), 2);
+    }
+
+    fn metric_event(session_id: &str, turn_id: &str, status: &str) -> TokenEvent {
+        TokenEvent {
+            _event_key: format!("{session_id}-{turn_id}"),
+            local_time: "2026-07-10 18:00:00 +08:00".to_string(),
+            utc_time: "2026-07-10 10:00:00".to_string(),
+            date: "2026-07-10".to_string(),
+            hour: 18,
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            token_event_index: 1,
+            project: "test-project".to_string(),
+            cwd: "test-project".to_string(),
+            user_message: String::new(),
+            user_message_preview: String::new(),
+            last_input_tokens: 100,
+            last_cached_input_tokens: 60,
+            last_output_tokens: 40,
+            last_reasoning_output_tokens: 10,
+            last_total_tokens: 140,
+            primary_used_percent: None,
+            status: status.to_string(),
+            preceding_action: None,
+        }
     }
 
     fn sample_jsonl() -> String {

@@ -318,7 +318,6 @@
   let syncing = false;
   let refreshPromise: Promise<void> | null = null;
   let dashboardRequestSequence = 0;
-  let activeDashboardRequest: { id: number; includeDetails: boolean } | null = null;
   let syncStatusMessage = "";
   let error = "";
   let showDateRangePicker = false;
@@ -352,7 +351,10 @@
   let detailSort: { key: DetailSortKey; direction: SortDirection } = { key: "lastTime", direction: "desc" };
   let monitorSort: { key: MonitorSortKey; direction: SortDirection } = { key: "lastTime", direction: "desc" };
   let updatedDetailRows = new Set<string>();
-  let monitorUserInputKeys = new Set<string>();
+  let monitorDetailRows: DetailRow[] = [];
+  let monitorRequestSequence = 0;
+  let monitorError = "";
+  let hasUnreadMonitorUpdates = false;
   let detailTableWrap: HTMLDivElement | null = null;
   let tooltip: TooltipState = { visible: false, text: "", x: 0, y: 0, placement: "below" };
   let tooltipHideTimer: ReturnType<typeof setTimeout> | null = null;
@@ -367,12 +369,10 @@
   const metricSkeletonLabels = [
     "当前筛选总 Token",
     "输入 Token",
-    "缓存输入",
-    "非缓存输入",
     "输出 Token",
-    "推理输出",
-    "TokenCount",
-    "超高行"
+    "每轮输入平均 Token",
+    "用户输入轮次",
+    "消耗超高输入轮次"
   ];
   const DEFAULT_UPDATE_SOURCE = "DonaldL81/codex-token-usage";
   const DASHBOARD_CACHE_KEY = "codex-token-usage-dashboard-cache";
@@ -385,11 +385,13 @@
     ? filterDetailRowsByStatus(data?.detailRows ?? [], "正常")
     : data?.detailRows ?? [];
   $: detailRowsByKey = new Map((data?.detailRows ?? []).map((row) => [row.rowKey, row]));
+  $: monitorDetailRowsByKey = new Map(monitorDetailRows.map((row) => [row.rowKey, row]));
   $: sortedDetailRows = sortDetailTreeRows(detailRows, detailSort);
   $: visibleDetailRows = visibleTreeRows(sortedDetailRows, expandedDetailRows);
   $: monitorRows = sortMonitorRows(
-    buildMonitorRows(data?.detailRows ?? [], monitorUserInputKeys, monitorStartedAt),
-    monitorSort
+    buildMonitorRows(monitorDetailRows, monitorStartedAt),
+    monitorSort,
+    monitorDetailRowsByKey
   );
   $: monthlyTrendBuckets = buildMonthlyTrendBuckets(appliedFilters, data?.monthlyBuckets ?? []);
   $: dailyTrendBuckets = buildDailyTrendBuckets(appliedFilters, data?.dailyBuckets ?? []);
@@ -511,7 +513,7 @@
     const promise = loadDashboard("refresh_usage", {
       preserveView: true,
       filters,
-      includeDetails: activePage !== "stats",
+      includeDetails: activePage === "detail",
       background: options.background ?? false
     }).finally(() => {
       refreshPromise = null;
@@ -529,7 +531,7 @@
     await loadDashboard("query_usage", {
       preserveView: false,
       filters,
-      includeDetails: activePage !== "stats"
+      includeDetails: activePage === "detail"
     });
   }
 
@@ -541,7 +543,7 @@
     await loadDashboard("query_usage", {
       preserveView: false,
       filters: { ...filters, search: appliedFilters.search },
-      includeDetails: activePage !== "stats"
+      includeDetails: activePage === "detail"
     });
   }
 
@@ -550,8 +552,7 @@
     options: LoadDashboardOptions
   ) {
     const requestId = ++dashboardRequestSequence;
-    const includeDetails = options.includeDetails ?? activePage !== "stats";
-    activeDashboardRequest = { id: requestId, includeDetails };
+    const includeDetails = options.includeDetails ?? activePage === "detail";
     loading = !options.background;
     syncing = Boolean(options.background);
     error = "";
@@ -568,7 +569,7 @@
       if (requestId !== dashboardRequestSequence) {
         return;
       }
-      if (!nextData.detailsLoaded && activePage !== "stats") {
+      if (!nextData.detailsLoaded && activePage === "detail") {
         await loadDashboard("query_usage", {
           preserveView: options.preserveView,
           filters: options.filters,
@@ -577,20 +578,27 @@
         });
         return;
       }
-      const canCompareRows = command === "refresh_usage" && Boolean(data) && filtersEqual(requestFilters, appliedFilters);
+      const canCompareRows =
+        command === "refresh_usage" &&
+        Boolean(data?.detailsLoaded) &&
+        nextData.detailsLoaded &&
+        filtersEqual(requestFilters, appliedFilters);
       const changedRows =
         canCompareRows && data
           ? changedDetailRows(data.detailRows, nextData.detailRows)
           : new Set<string>();
       updatedDetailRows = changedRows;
-  if (canCompareRows) {
-    monitorUserInputKeys = collectMonitorUserInputKeys(monitorUserInputKeys, changedRows, nextData.detailRows);
-  }
       data = nextData;
       if (!nextData.detailsLoaded) {
         saveDashboardCache(nextData);
       }
       appliedFilters = requestFilters;
+      if (
+        command === "refresh_usage" &&
+        (nextData.scanState.lastRunNewTokenEvents > 0 || activePage === "monitor")
+      ) {
+        await loadMonitorRows();
+      }
       if (snapshot) {
         await restoreViewSnapshot(snapshot, nextData);
       } else {
@@ -611,7 +619,6 @@
       }
     } finally {
       if (requestId === dashboardRequestSequence) {
-        activeDashboardRequest = null;
         loading = false;
         syncing = false;
       }
@@ -692,43 +699,46 @@
     );
   }
 
-  function collectMonitorUserInputKeys(
-    existingKeys: Set<string>,
-    changedRows: Set<string>,
-    rows: DetailRow[]
-  ): Set<string> {
-    if (changedRows.size === 0) return existingKeys;
-    const byKey = new Map(rows.map((row) => [row.rowKey, row]));
-    const next = new Set(existingKeys);
-    for (const key of changedRows) {
-      const row = byKey.get(key);
-      const inputKey = row ? userInputKeyForRow(row, byKey) : null;
-      if (inputKey) {
-        next.add(inputKey);
+  async function loadMonitorRows() {
+    const requestId = ++monitorRequestSequence;
+    const monitorFilters: UsageFilters & { includeDetails: boolean } = {
+      dateFrom: formatDateValue(monitorStartedAt),
+      dateTo: todayLocalDate(),
+      project: "",
+      session: "",
+      search: "",
+      onlyAnomalies: false,
+      includeDetails: true
+    };
+    try {
+      const monitorData = await invoke<DashboardData>("query_usage", { filters: monitorFilters });
+      if (requestId === monitorRequestSequence) {
+        const previousRows = buildMonitorRows(monitorDetailRows, monitorStartedAt);
+        const previousSignatures = new Map(previousRows.map((row) => [row.rowKey, detailRowSignature(row)]));
+        const nextRows = buildMonitorRows(monitorData.detailRows, monitorStartedAt);
+        const hasUpdates = nextRows.some(
+          (row) => previousSignatures.get(row.rowKey) !== detailRowSignature(row)
+        );
+        monitorDetailRows = monitorData.detailRows;
+        monitorError = "";
+        if (hasUpdates && activePage !== "monitor") {
+          hasUnreadMonitorUpdates = true;
+        }
+      }
+    } catch (unknownError) {
+      if (requestId === monitorRequestSequence) {
+        monitorError = unknownError instanceof Error ? unknownError.message : String(unknownError);
       }
     }
-    return next;
   }
 
-  function buildMonitorRows(rows: DetailRow[], userInputKeys: Set<string>, startedAt: Date): DetailRow[] {
-    if (userInputKeys.size === 0) return [];
-    return rows.filter(
-      (row) => row.kind === "UserInput" && userInputKeys.has(row.rowKey) && isAfterMonitorStart(row, startedAt)
-    );
+  function buildMonitorRows(rows: DetailRow[], startedAt: Date): DetailRow[] {
+    return rows.filter((row) => row.kind === "UserInput" && isAfterMonitorStart(row, startedAt));
   }
 
   function isAfterMonitorStart(row: DetailRow, startedAt: Date): boolean {
     const rowTime = parseLocalDateTime(row.lastTime || row.time);
     return Boolean(rowTime && rowTime.getTime() >= startedAt.getTime());
-  }
-
-  function userInputKeyForRow(row: DetailRow, byKey = detailRowsByKey): string | null {
-    let current: DetailRow | undefined = row;
-    while (current) {
-      if (current.kind === "UserInput") return current.rowKey;
-      current = current.parentKey ? byKey.get(current.parentKey) : undefined;
-    }
-    return null;
   }
 
   function ancestorOfKind(row: DetailRow, kind: string, byKey = detailRowsByKey): DetailRow | null {
@@ -847,12 +857,13 @@
 
   function sortMonitorRows(
     rows: DetailRow[],
-    sort: { key: MonitorSortKey; direction: SortDirection }
+    sort: { key: MonitorSortKey; direction: SortDirection },
+    rowsByKey: Map<string, DetailRow>
   ): DetailRow[] {
     return [...rows].sort((left, right) => {
       let result = 0;
       if (sort.key === "projectSession") {
-        result = detailProjectSessionText(left).localeCompare(detailProjectSessionText(right), "zh-CN", {
+        result = detailProjectSessionText(left, rowsByKey).localeCompare(detailProjectSessionText(right, rowsByKey), "zh-CN", {
           numeric: true,
           sensitivity: "base"
         });
@@ -926,16 +937,24 @@
   }
 
   function setPage(page: Page) {
+    if (page === activePage) return;
     activePage = page;
+    if (page === "monitor") {
+      hasUnreadMonitorUpdates = false;
+    }
     saveUiState();
-    const needsDetails =
-      page !== "stats" && (!data?.detailsLoaded || activeDashboardRequest?.includeDetails === false);
-    if (needsDetails) {
-      void loadDashboard("query_usage", {
-        preserveView: false,
-        filters: appliedFilters,
-        includeDetails: true
+    if (page === "detail") {
+      void refreshUsage().then(() => {
+        if (activePage === "detail" && !data?.detailsLoaded) {
+          return loadDashboard("query_usage", {
+            preserveView: false,
+            filters: appliedFilters,
+            includeDetails: true
+          });
+        }
       });
+    } else if (page === "monitor") {
+      void refreshUsage();
     }
   }
 
@@ -1338,9 +1357,9 @@
     return text.replace(/\s+/g, " ").trim();
   }
 
-  function detailProjectSessionText(row: DetailRow): string {
-    const projectRow = ancestorOfKind(row, "Project");
-    const sessionRow = ancestorOfKind(row, "Session");
+  function detailProjectSessionText(row: DetailRow, byKey = detailRowsByKey): string {
+    const projectRow = ancestorOfKind(row, "Project", byKey);
+    const sessionRow = ancestorOfKind(row, "Session", byKey);
     const projectName = projectRow ? detailNodeText(projectRow) : row.project || "-";
     const sessionName = sessionRow ? detailNodeText(sessionRow) : row.sessionId || "-";
     return `${projectName}/${sessionName}`;
@@ -1834,6 +1853,21 @@
     </div>
   </header>
 
+  <nav class="page-nav" aria-label="页面">
+    <button type="button" class:active={activePage === "stats"} aria-current={activePage === "stats" ? "page" : undefined} on:click={() => setPage("stats")}>统计看板</button>
+    <button type="button" class:active={activePage === "detail"} aria-current={activePage === "detail" ? "page" : undefined} on:click={() => setPage("detail")}>全量明细</button>
+    <button
+      type="button"
+      class:active={activePage === "monitor"}
+      aria-current={activePage === "monitor" ? "page" : undefined}
+      aria-label={hasUnreadMonitorUpdates ? "实时监控，有新更新" : "实时监控"}
+      on:click={() => setPage("monitor")}
+    >
+      实时监控
+      {#if hasUnreadMonitorUpdates}<span class="tab-update-dot" aria-hidden="true"></span>{/if}
+    </button>
+  </nav>
+
   {#if error}
     <section class="alert">{error}</section>
   {/if}
@@ -1847,17 +1881,6 @@
   {/if}
 
   <section class="view-toolbar">
-    <nav aria-label="页面">
-      <button class:active={activePage === "stats"} on:click={() => setPage("stats")}>
-        统计看板
-      </button>
-      <button class:active={activePage === "detail"} on:click={() => setPage("detail")}>
-        全量明细
-      </button>
-      <button class:active={activePage === "monitor"} on:click={() => setPage("monitor")}>
-        实时监控
-      </button>
-    </nav>
     <section class="filters header-filters">
       <div class="date-range-filter">
         <button type="button" class="date-range-button" aria-label="日期范围" on:click={toggleDateRangePicker}>
@@ -1950,7 +1973,7 @@
         on:click={() => refreshUsage()}
         disabled={loading}
       >
-        {loading || syncing ? "同步中" : "刷新"}
+        {loading || syncing ? "刷新中" : "刷新"}
       </button>
     </section>
   </section>
@@ -1958,41 +1981,56 @@
   {#if metrics || initialLoading}
     <section class="metric-grid" class:loading-skeleton={initialLoading}>
       {#if metrics}
-        <article>
+        <article class="metric-card metric-card-primary">
           <span>当前筛选总 Token</span>
           <strong class="blue">{formatToken(metrics.totalTokens)}</strong>
         </article>
-        <article>
-          <span>输入 Token</span>
-          <strong class="blue">{formatToken(metrics.inputTokens)}</strong>
+        <article class="metric-card metric-card-composite">
+          <div class="metric-composite-body">
+            <div class="metric-total">
+              <span>输入 Token</span>
+              <strong class="blue">{formatToken(metrics.inputTokens)}</strong>
+            </div>
+            <div class="metric-breakdown">
+              <span>缓存输入 <b class="green">{formatToken(metrics.cachedInputTokens)}</b></span>
+              <span>未缓存输入 <b class="orange">{formatToken(metrics.nonCachedInputTokens)}</b></span>
+            </div>
+          </div>
         </article>
-        <article>
-          <span>缓存输入</span>
-          <strong class="green">{formatToken(metrics.cachedInputTokens)}</strong>
+        <article class="metric-card metric-card-composite">
+          <div class="metric-composite-body">
+            <div class="metric-total">
+              <span>输出 Token</span>
+              <strong class="blue">{formatToken(metrics.outputTokens)}</strong>
+            </div>
+            <div class="metric-breakdown">
+              <span>推理输出 <b>{formatToken(metrics.reasoningOutputTokens)}</b></span>
+              <span title="输出 Token 扣除推理 Token 后的数量，可能包含回答、工具调用等模型输出。">
+                可见输出 <b>{formatToken(Math.max(metrics.outputTokens - metrics.reasoningOutputTokens, 0))}</b>
+              </span>
+            </div>
+          </div>
         </article>
-        <article>
-          <span>非缓存输入</span>
-          <strong class="orange">{formatToken(metrics.nonCachedInputTokens)}</strong>
+        <article class="metric-card metric-card-primary">
+          <span>每轮输入平均 Token</span>
+          <strong class="blue">
+            {formatToken(metrics.userMessageCount > 0 ? Math.round(metrics.totalTokens / metrics.userMessageCount) : 0)}
+          </strong>
         </article>
-        <article>
-          <span>输出 Token</span>
-          <strong class="blue">{formatToken(metrics.outputTokens)}</strong>
+        <article class="metric-card">
+          <span>用户输入轮次</span>
+          <strong>{formatCount(metrics.userMessageCount)}</strong>
         </article>
-        <article>
-          <span>推理输出</span>
-          <strong class="blue">{formatToken(metrics.reasoningOutputTokens)}</strong>
-        </article>
-        <article>
-          <span>TokenCount</span>
-          <strong>{formatCount(metrics.tokenEventCount)}</strong>
-        </article>
-        <article>
-          <span>超高行</span>
-          <strong class="red">{formatCount(metrics.abnormalCount)}</strong>
+        <article class="metric-card" class:metric-card-alert={metrics.abnormalCount > 0}>
+          <span>消耗超高输入轮次</span>
+          <strong class:red={metrics.abnormalCount > 0}>{formatCount(metrics.abnormalCount)}</strong>
         </article>
       {:else}
         {#each metricSkeletonLabels as label}
-          <article>
+          <article
+            class="metric-card"
+            class:metric-card-primary={label === "当前筛选总 Token" || label === "每轮输入平均 Token"}
+          >
             <span>{label}</span>
             <strong aria-hidden="true"></strong>
           </article>
@@ -2009,13 +2047,16 @@
       <div class="panel-title detail-title">
         <div class="detail-controls-row">
           {#if isMonitorPage}
-            <div class="detail-note">仅展示本次启动后新增或变动会话中的用户输入。</div>
+            <div class="detail-note" class:monitor-error={Boolean(monitorError)}>
+              {monitorError || "仅展示本次启动后新增或变动会话中的用户输入。"}
+            </div>
           {:else}
             <div class="level-legend">
               {#each detailLevelControls as control}
                 <button
                   type="button"
                   class:active={detailExpandLevel === control.level}
+                  class:low-priority={control.level >= 3}
                   on:click={() => expandDetailToLevel(control.level)}
                   disabled={!data}
                 >
@@ -2203,7 +2244,9 @@
                   {/if}
                   </td>
                 {#if isMonitorPage}
-                  <td class="project-session" title={detailProjectSessionText(row)}>{detailProjectSessionText(row)}</td>
+                  <td class="project-session" title={detailProjectSessionText(row, monitorDetailRowsByKey)}>
+                    {detailProjectSessionText(row, monitorDetailRowsByKey)}
+                  </td>
                 {/if}
                 <td>
                   <span class="time-cell" class:updated={updatedDetailRows.has(row.rowKey)}>

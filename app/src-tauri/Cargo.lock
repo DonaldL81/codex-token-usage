@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "codex-token-usage"
-version = "1.0.10"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "quick-xml",
