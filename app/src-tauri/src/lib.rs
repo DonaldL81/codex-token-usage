@@ -1147,9 +1147,7 @@ fn check_update_from_source(source: &str) -> Result<UpdateInfoDto, Box<dyn std::
         .build()?;
     let response = client.get(&api_url).send()?;
     if response.status().is_client_error() || response.status().is_server_error() {
-        if response.status() == reqwest::StatusCode::FORBIDDEN
-            || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
+        if should_use_atom_fallback(response.status()) {
             return check_update_from_atom(&client, &api_url, &current_version);
         }
         return Err(response.error_for_status().unwrap_err().into());
@@ -1182,6 +1180,15 @@ fn check_update_from_source(source: &str) -> Result<UpdateInfoDto, Box<dyn std::
         has_update,
         message,
     })
+}
+
+fn should_use_atom_fallback(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::NOT_FOUND
+    )
 }
 
 fn check_update_from_atom(
@@ -4357,6 +4364,16 @@ mod tests {
             normalize_update_source("https://github.com/owner/repo").unwrap(),
             "https://api.github.com/repos/owner/repo/releases/latest"
         );
+    }
+
+    #[test]
+    fn github_latest_release_unavailable_uses_atom_fallback() {
+        assert!(should_use_atom_fallback(reqwest::StatusCode::FORBIDDEN));
+        assert!(should_use_atom_fallback(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_use_atom_fallback(reqwest::StatusCode::NOT_FOUND));
+        assert!(!should_use_atom_fallback(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     #[test]

@@ -1102,23 +1102,31 @@
   function updateButtonLabel(): string {
     if (updateButtonStatus === "downloading") {
       const progress = updateDownloadProgress;
+      const version = updateInfo?.latestVersion ? ` v${updateInfo.latestVersion}` : "";
       if (progress?.totalBytes && progress.totalBytes > 0) {
-        return `下载中 ${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`;
+        return `下载${version} ${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`;
       }
       if (progress && progress.downloadedBytes > 0) {
-        return `下载中 ${formatBytes(progress.downloadedBytes)}`;
+        return `下载${version} ${formatBytes(progress.downloadedBytes)}`;
       }
-      return "下载中";
+      return `下载中${version}`;
     }
     if (updateButtonStatus === "failed") {
       return updateResultMessage.startsWith("检查更新失败") ? "检查失败" : "更新失败";
     }
+    if (updateButtonStatus === "latest") {
+      const version = updateInfo?.currentVersion || appVersion;
+      return version ? `已是最新 v${version}` : "已是最新";
+    }
+    if (updateButtonStatus === "ready") {
+      return updateInfo?.latestVersion ? `立即更新 v${updateInfo.latestVersion}` : "立即更新";
+    }
     const labels: Record<Exclude<typeof updateButtonStatus, "downloading" | "failed">, string> = {
       idle: "检查更新",
-      checking: "检查中",
-      latest: "已是最新",
-      ready: "立即更新",
-      installing: "安装中"
+      checking: "检查中...",
+      latest: "",
+      ready: "",
+      installing: "安装中..."
     };
     return labels[updateButtonStatus];
   }
