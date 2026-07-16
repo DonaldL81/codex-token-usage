@@ -75,6 +75,12 @@
     sizeBytes: number;
   };
 
+  type UpdateDownloadProgress = {
+    downloadedBytes: number;
+    totalBytes: number | null;
+    percent: number | null;
+  };
+
   type UpdateRuntimeInfo = {
     currentExePath: string;
     stableEntryPath: string;
@@ -311,6 +317,8 @@
   let loading = false;
   let syncing = false;
   let refreshPromise: Promise<void> | null = null;
+  let dashboardRequestSequence = 0;
+  let activeDashboardRequest: { id: number; includeDetails: boolean } | null = null;
   let syncStatusMessage = "";
   let error = "";
   let showDateRangePicker = false;
@@ -323,7 +331,7 @@
   let updateButtonStatus: "idle" | "checking" | "latest" | "ready" | "downloading" | "installing" | "failed" =
     "idle";
   let updateResultMessage = "";
-  let updateStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  let updateDownloadProgress: UpdateDownloadProgress | null = null;
   let editingSessionsRoot = false;
   let draftSessionsRoot = settings.sessionsRoot;
   let editingRefreshInterval = false;
@@ -333,6 +341,8 @@
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
   let trayUnlisten: UnlistenFn | null = null;
   let trayCheckUpdateUnlisten: UnlistenFn | null = null;
+  let updateProgressUnlisten: UnlistenFn | null = null;
+  let startupUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   let stableEntryEnsured = false;
   let expandedDetailRows = new Set<string>();
   let detailExpandLevel: number | null = 0;
@@ -421,6 +431,19 @@
       });
     restoreUiState();
     void bootstrapUsage();
+    startupUpdateTimer = setTimeout(() => {
+      startupUpdateTimer = null;
+      maybeAutoCheckUpdate();
+    }, 1200);
+    listen<UpdateDownloadProgress>("update-download-progress", (event) => {
+      updateDownloadProgress = event.payload;
+    })
+      .then((unlisten) => {
+        updateProgressUnlisten = unlisten;
+      })
+      .catch(() => {
+        updateProgressUnlisten = null;
+      });
     listen("tray-refresh", () => refreshUsage())
       .then((unlisten) => {
         trayUnlisten = unlisten;
@@ -445,8 +468,11 @@
     if (trayCheckUpdateUnlisten) {
       trayCheckUpdateUnlisten();
     }
-    if (updateStatusTimer) {
-      clearTimeout(updateStatusTimer);
+    if (updateProgressUnlisten) {
+      updateProgressUnlisten();
+    }
+    if (startupUpdateTimer) {
+      clearTimeout(startupUpdateTimer);
     }
     cancelTooltipHide();
   });
@@ -512,6 +538,9 @@
     command: "refresh_usage" | "query_usage",
     options: LoadDashboardOptions
   ) {
+    const requestId = ++dashboardRequestSequence;
+    const includeDetails = options.includeDetails ?? activePage !== "stats";
+    activeDashboardRequest = { id: requestId, includeDetails };
     loading = !options.background;
     syncing = Boolean(options.background);
     error = "";
@@ -519,12 +548,24 @@
     const requestFilters = {
       ...options.filters,
       onlyAnomalies: false,
-      includeDetails: options.includeDetails ?? activePage !== "stats"
+      includeDetails
     };
     try {
       const nextData = await invoke<DashboardData>(command, {
         filters: requestFilters
       });
+      if (requestId !== dashboardRequestSequence) {
+        return;
+      }
+      if (!nextData.detailsLoaded && activePage !== "stats") {
+        await loadDashboard("query_usage", {
+          preserveView: options.preserveView,
+          filters: options.filters,
+          includeDetails: true,
+          background: options.background
+        });
+        return;
+      }
       const canCompareRows = command === "refresh_usage" && Boolean(data) && filtersEqual(requestFilters, appliedFilters);
       const changedRows =
         canCompareRows && data
@@ -554,10 +595,15 @@
       }, 0);
       saveUiState();
     } catch (unknownError) {
-      error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+      if (requestId === dashboardRequestSequence) {
+        error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+      }
     } finally {
-      loading = false;
-      syncing = false;
+      if (requestId === dashboardRequestSequence) {
+        activeDashboardRequest = null;
+        loading = false;
+        syncing = false;
+      }
     }
   }
 
@@ -871,14 +917,16 @@
   function setPage(page: Page) {
     activePage = page;
     saveUiState();
-  if (page !== "stats" && data && !data.detailsLoaded) {
-    void loadDashboard("query_usage", {
-      preserveView: false,
-      filters: appliedFilters,
-      includeDetails: true
-    });
+    const needsDetails =
+      page !== "stats" && (!data?.detailsLoaded || activeDashboardRequest?.includeDetails === false);
+    if (needsDetails) {
+      void loadDashboard("query_usage", {
+        preserveView: false,
+        filters: appliedFilters,
+        includeDetails: true
+      });
+    }
   }
-}
 
   function toggleDateRangePicker() {
     showDateRangePicker = !showDateRangePicker;
@@ -959,6 +1007,7 @@
     }
     const autoInstall = options.autoInstall ?? true;
     updateResultMessage = "正在检查更新...";
+    updateDownloadProgress = null;
     setUpdateButtonStatus("checking");
     error = "";
     try {
@@ -992,6 +1041,7 @@
       return;
     }
     setUpdateButtonStatus("downloading");
+    updateDownloadProgress = null;
     updateResultMessage = `正在下载 v${updateInfo.latestVersion ?? "新版本"}...`;
     error = "";
     try {
@@ -1037,42 +1087,38 @@
 
   function maybeAutoCheckUpdate() {
     if (autoUpdateChecked) return;
-    const key = "codex-token-usage-last-update-check";
-    const lastChecked = Number(localStorage.getItem(key) ?? "0");
-    const twelveHours = 12 * 60 * 60 * 1000;
-    if (Number.isFinite(lastChecked) && Date.now() - lastChecked < twelveHours) return;
     autoUpdateChecked = true;
-    localStorage.setItem(key, String(Date.now()));
-    checkUpdate();
+    void checkUpdate();
   }
 
   function setUpdateButtonStatus(status: typeof updateButtonStatus) {
-    if (updateStatusTimer) {
-      clearTimeout(updateStatusTimer);
-      updateStatusTimer = null;
-    }
     updateButtonStatus = status;
   }
 
   function setTemporaryUpdateStatus(status: "latest" | "failed") {
     setUpdateButtonStatus(status);
-    updateStatusTimer = setTimeout(() => {
-      if (updateButtonStatus === status) {
-        updateButtonStatus = "idle";
-      }
-      updateStatusTimer = null;
-    }, 2500);
   }
 
   function updateButtonLabel(): string {
-    const labels: Record<typeof updateButtonStatus, string> = {
+    if (updateButtonStatus === "downloading") {
+      const progress = updateDownloadProgress;
+      if (progress?.totalBytes && progress.totalBytes > 0) {
+        return `下载中 ${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`;
+      }
+      if (progress && progress.downloadedBytes > 0) {
+        return `下载中 ${formatBytes(progress.downloadedBytes)}`;
+      }
+      return "下载中";
+    }
+    if (updateButtonStatus === "failed") {
+      return updateResultMessage.startsWith("检查更新失败") ? "检查失败" : "更新失败";
+    }
+    const labels: Record<Exclude<typeof updateButtonStatus, "downloading" | "failed">, string> = {
       idle: "检查更新",
       checking: "检查中",
       latest: "已是最新",
       ready: "立即更新",
-      downloading: "下载中",
-      installing: "安装中",
-      failed: "更新失败"
+      installing: "安装中"
     };
     return labels[updateButtonStatus];
   }
@@ -1201,6 +1247,18 @@
 
   function formatCount(value: number): string {
     return new Intl.NumberFormat("zh-CN").format(value);
+  }
+
+  function formatBytes(value: number): string {
+    if (!Number.isFinite(value) || value < 1024) return `${Math.max(0, Math.round(value || 0))} B`;
+    const units = ["KB", "MB", "GB"];
+    let size = value;
+    let unitIndex = -1;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+    return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`;
   }
 
   function statusClass(status: string): string {
@@ -2110,6 +2168,9 @@
                     <button
                       type="button"
                       class="node-label node-tooltip-trigger"
+                      class:expandable={row.hasChildren}
+                      aria-expanded={row.hasChildren ? expandedDetailRows.has(row.rowKey) : undefined}
+                      on:click={() => row.hasChildren && toggleDetailRow(row.rowKey)}
                       on:mouseenter={(event) => showTooltip(event, detailTooltipText(row))}
                       on:mouseleave={scheduleHideTooltip}
                       on:focus={(event) => showTooltip(event, detailTooltipText(row))}
@@ -2421,17 +2482,16 @@
       type="button"
       class="status-update-button"
       class:primary={updateButtonStatus === "ready" || updateButtonStatus === "installing"}
+      class:latest={updateButtonStatus === "latest"}
+      class:failed={updateButtonStatus === "failed"}
+      class:progress={updateButtonStatus === "checking" || updateButtonStatus === "downloading" || updateButtonStatus === "installing"}
       on:click={handleUpdateButton}
       disabled={updateButtonDisabled()}
       title={updateResultMessage || updateButtonLabel()}
+      aria-live="polite"
     >
       {updateButtonLabel()}
     </button>
-    {#if updateResultMessage}
-      <span class={`update-result ${updateButtonStatus}`} role="status" aria-live="polite" title={updateResultMessage}>
-        {updateResultMessage}
-      </span>
-    {/if}
     {#if syncStatusMessage}
       <span role="status" aria-live="polite">{syncStatusMessage}</span>
     {:else if data?.performanceTimings?.totalMs}

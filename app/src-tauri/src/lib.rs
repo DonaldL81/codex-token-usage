@@ -715,7 +715,7 @@ pub fn run() {
                 MenuItem::with_id(app, "check_update", "检查更新", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &refresh, &check_update, &quit])?;
-            let tray_icon = Image::from_bytes(include_bytes!("../icons/tray-icon-24.png"))?;
+            let tray_icon = Image::from_bytes(include_bytes!("../icons/tray-icon-32.png"))?;
             TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .menu(&menu)

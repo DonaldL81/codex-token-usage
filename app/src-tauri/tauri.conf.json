@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Codex Token Usage",
-  "version": "1.0.6",
+  "version": "1.0.8",
   "identifier": "com.local.codex-token-usage",
   "build": {
     "beforeDevCommand": "npm run dev",

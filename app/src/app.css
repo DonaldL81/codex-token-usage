@@ -1070,6 +1070,10 @@ td:last-child {
   text-align: left;
 }
 
+.node-tooltip-trigger.expandable {
+  cursor: pointer;
+}
+
 .node-tooltip-trigger:focus-visible {
   outline: 1px solid #9ebcf5;
   outline-offset: 2px;
@@ -1896,34 +1900,27 @@ td:last-child {
   white-space: nowrap;
 }
 
-.update-result {
-  min-width: 0;
-  max-width: min(520px, 38vw);
-  flex: 0 1 auto;
+.status-update-button {
+  min-width: 84px;
+  max-width: min(250px, 24vw);
+  height: 22px;
+  padding: 0 10px;
+  font-size: 12px;
   overflow: hidden;
-  color: #64738d;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.update-result.latest {
+.status-update-button.latest {
   color: var(--data-green);
 }
 
-.update-result.failed {
+.status-update-button.failed {
   color: var(--data-red);
 }
 
-.update-result.downloading,
-.update-result.installing,
-.update-result.checking {
+.status-update-button.progress {
   color: var(--data-blue);
-}
-
-.status-update-button {
-  height: 22px;
-  padding: 0 10px;
-  font-size: 12px;
 }
 
 .status-update-button.primary {
