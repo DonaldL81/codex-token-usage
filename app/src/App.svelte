@@ -325,6 +325,7 @@
   let calendarBaseMonth = startOfMonth(parseDateValue(defaultFilters().dateFrom) ?? new Date());
   let rangeAnchor: string | null = null;
   let settingsMessage = "";
+  let toastMessage = "";
   let updateInfo: UpdateInfo | null = null;
   let appVersion = "";
   let updateRuntimeInfo: UpdateRuntimeInfo | null = null;
@@ -335,6 +336,7 @@
   let updateButtonText = "检查更新";
   let updateButtonIsDisabled = false;
   let editingSessionsRoot = false;
+  let showSessionsRootEditDialog = false;
   let draftSessionsRoot = settings.sessionsRoot;
   let editingRefreshInterval = false;
   let draftRefreshIntervalSeconds = settings.refreshIntervalSeconds;
@@ -345,10 +347,12 @@
   let trayCheckUpdateUnlisten: UnlistenFn | null = null;
   let updateProgressUnlisten: UnlistenFn | null = null;
   let startupUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let stableEntryEnsured = false;
   let expandedDetailRows = new Set<string>();
   let detailExpandLevel: number | null = 0;
-  let showOnlyAnomalies = false;
+  let showOnlySuperHigh = false;
+  let showOnlyHigh = false;
   let detailSort: { key: DetailSortKey; direction: SortDirection } = { key: "lastTime", direction: "desc" };
   let monitorSort: { key: MonitorSortKey; direction: SortDirection } = { key: "lastTime", direction: "desc" };
   let updatedDetailRows = new Set<string>();
@@ -358,6 +362,8 @@
   let monitorError = "";
   let hasUnreadMonitorUpdates = false;
   let detailTableWrap: HTMLDivElement | null = null;
+  let sessionsRootInput: HTMLInputElement | null = null;
+  let sessionsRootDialog: HTMLDivElement | null = null;
   let tooltip: TooltipState = { visible: false, text: "", x: 0, y: 0, placement: "below", compact: false };
   let tooltipHideTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -387,8 +393,12 @@
   $: metrics = data?.metrics;
   $: initialLoading = loading && !data;
   $: filteredSessionOptions = filterSessionOptions(data?.sessionOptions ?? [], filters.project);
-  $: detailRows = showOnlyAnomalies
-    ? filterDetailRowsByStatus(data?.detailRows ?? [], "正常")
+  $: detailStatusFilters = new Set([
+    ...(showOnlySuperHigh ? ["超高", "异常"] : []),
+    ...(showOnlyHigh ? ["偏高"] : [])
+  ]);
+  $: detailRows = detailStatusFilters.size > 0
+    ? filterDetailRowsByStatuses(data?.detailRows ?? [], detailStatusFilters)
     : data?.detailRows ?? [];
   $: detailRowsByKey = new Map((data?.detailRows ?? []).map((row) => [row.rowKey, row]));
   $: monitorDetailRowsByKey = new Map(monitorDetailRows.map((row) => [row.rowKey, row]));
@@ -492,6 +502,9 @@
     }
     if (startupUpdateTimer) {
       clearTimeout(startupUpdateTimer);
+    }
+    if (toastTimer) {
+      clearTimeout(toastTimer);
     }
     cancelTooltipHide();
   });
@@ -788,11 +801,11 @@
     });
   }
 
-  function filterDetailRowsByStatus(rows: DetailRow[], normalStatus: string): DetailRow[] {
+  function filterDetailRowsByStatuses(rows: DetailRow[], statuses: ReadonlySet<string>): DetailRow[] {
     const byKey = new Map(rows.map((row) => [row.rowKey, row]));
     const keepKeys = new Set<string>();
     rows
-      .filter((row) => row.status !== normalStatus)
+      .filter((row) => statuses.has(row.status))
       .forEach((row) => {
         keepKeys.add(row.rowKey);
         let parentKey = row.parentKey;
@@ -937,12 +950,19 @@
     detailExpandLevel = level;
   }
 
-  function toggleOnlyAnomalies() {
-    const nextShowOnlyAnomalies = !showOnlyAnomalies;
-    showOnlyAnomalies = nextShowOnlyAnomalies;
+  function toggleDetailStatusFilter(status: "super-high" | "high") {
+    if (status === "super-high") {
+      showOnlySuperHigh = !showOnlySuperHigh;
+    } else {
+      showOnlyHigh = !showOnlyHigh;
+    }
     if (detailExpandLevel !== null) {
-      const sourceRows = nextShowOnlyAnomalies
-        ? filterDetailRowsByStatus(data?.detailRows ?? [], "正常")
+      const statuses = new Set([
+        ...(showOnlySuperHigh ? ["超高", "异常"] : []),
+        ...(showOnlyHigh ? ["偏高"] : [])
+      ]);
+      const sourceRows = statuses.size > 0
+        ? filterDetailRowsByStatuses(data?.detailRows ?? [], statuses)
         : data?.detailRows ?? [];
       const keys = sourceRows
         .filter((row) => row.hasChildren && row.level < detailExpandLevel!)
@@ -991,9 +1011,59 @@
     await autoApplyFilters({ ...filters, dateFrom: draftDateFrom, dateTo: draftDateTo });
   }
 
-  function startEditSessionsRoot() {
+  async function startEditSessionsRoot() {
+    showSessionsRootEditDialog = true;
+    await tick();
+    sessionsRootDialog?.focus();
+  }
+
+  function closeSessionsRootEditDialog() {
+    showSessionsRootEditDialog = false;
+  }
+
+  async function continueEditingSessionsRoot() {
+    showSessionsRootEditDialog = false;
     draftSessionsRoot = settings.sessionsRoot;
     editingSessionsRoot = true;
+    await tick();
+    sessionsRootInput?.focus();
+    sessionsRootInput?.select();
+  }
+
+  async function restoreDefaultSessionsRoot() {
+    showSessionsRootEditDialog = false;
+    editingSessionsRoot = false;
+    settingsMessage = "";
+    error = "";
+    try {
+      const defaultSessionsRoot = await invoke<string>("get_default_sessions_root");
+      const saved = await saveAppConfig(
+        { ...settings, sessionsRoot: defaultSessionsRoot },
+        { refreshAfter: true, showSavedMessage: false }
+      );
+      if (saved) {
+        showToast("会话目录已恢复为自动查找结果");
+      }
+    } catch (unknownError) {
+      error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+    }
+  }
+
+  function handleSessionsRootDialogKeydown(event: KeyboardEvent) {
+    if (showSessionsRootEditDialog && event.key === "Escape") {
+      closeSessionsRootEditDialog();
+    }
+  }
+
+  function showToast(message: string) {
+    if (toastTimer) {
+      clearTimeout(toastTimer);
+    }
+    toastMessage = message;
+    toastTimer = setTimeout(() => {
+      toastMessage = "";
+      toastTimer = null;
+    }, 3000);
   }
 
   function cancelEditSessionsRoot() {
@@ -1011,7 +1081,10 @@
     editingRefreshInterval = false;
   }
 
-  async function saveAppConfig(nextConfig: AppConfig, options: { refreshAfter: boolean }) {
+  async function saveAppConfig(
+    nextConfig: AppConfig,
+    options: { refreshAfter: boolean; showSavedMessage?: boolean }
+  ): Promise<boolean> {
     settingsMessage = "";
     exportMessage = "";
     error = "";
@@ -1023,12 +1096,16 @@
       );
       syncSettingsDrafts(settings);
       setupRefreshTimer(settings.refreshIntervalSeconds);
-      settingsMessage = "设置已保存";
+      if (options.showSavedMessage !== false) {
+        settingsMessage = "设置已保存";
+      }
       if (options.refreshAfter) {
         await refreshUsage();
       }
+      return true;
     } catch (unknownError) {
       error = unknownError instanceof Error ? unknownError.message : String(unknownError);
+      return false;
     }
   }
 
@@ -1763,6 +1840,8 @@
   }
 </script>
 
+<svelte:window on:keydown={handleSessionsRootDialogKeydown} />
+
 <main class="app-shell" on:contextmenu|preventDefault>
   <header class="topbar">
     <div>
@@ -1837,6 +1916,7 @@
           <span class="toolbar-input-title">会话目录</span>
           <input
             type="text"
+            bind:this={sessionsRootInput}
             bind:value={draftSessionsRoot}
             readonly={!editingSessionsRoot}
             title={draftSessionsRoot}
@@ -2105,17 +2185,30 @@
             </div>
           {/if}
           <div class="detail-tools">
-            <span class="row-count">{formatCount(detailTableRows.length)} / {formatCount(detailTotalRows)} 行</span>
-            {#if !isMonitorPage}
+            {#if isMonitorPage}
+              <span class="row-count">{formatCount(detailTableRows.length)} / {formatCount(detailTotalRows)} 行</span>
+            {:else}
               <button
                 type="button"
-                class:active={showOnlyAnomalies}
-                on:click={toggleOnlyAnomalies}
+                class="status-filter status-super-high"
+                class:active={showOnlySuperHigh}
+                aria-pressed={showOnlySuperHigh}
+                on:click={() => toggleDetailStatusFilter("super-high")}
                 disabled={!data}
               >
-                仅过高
+                超高
               </button>
-              <button on:click={exportDetail} disabled={!data}>导出明细</button>
+              <button
+                type="button"
+                class="status-filter status-high"
+                class:active={showOnlyHigh}
+                aria-pressed={showOnlyHigh}
+                on:click={() => toggleDetailStatusFilter("high")}
+                disabled={!data}
+              >
+                偏高
+              </button>
+              <span class="row-count">{formatCount(detailTableRows.length)} / {formatCount(detailTotalRows)} 行</span>
             {/if}
           </div>
         </div>
@@ -2582,6 +2675,33 @@
       on:mouseenter={cancelTooltipHide}
       on:mouseleave={scheduleHideTooltip}
     >{tooltip.text}</div>
+  {/if}
+
+  {#if showSessionsRootEditDialog}
+    <div class="dialog-backdrop" role="presentation" on:click={closeSessionsRootEditDialog}>
+      <div
+        bind:this={sessionsRootDialog}
+        class="confirmation-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="sessions-root-dialog-title"
+        tabindex="-1"
+        on:click|stopPropagation
+        on:keydown|stopPropagation
+      >
+        <h2 id="sessions-root-dialog-title">修改会话目录</h2>
+        <p>会话目录通常会自动识别。仅在会话读取异常时手动调整；其他情况下建议保留默认设置。</p>
+        <div class="confirmation-dialog-actions">
+          <button type="button" class="ghost" on:click={closeSessionsRootEditDialog}>取消</button>
+          <button type="button" on:click={restoreDefaultSessionsRoot} disabled={loading}>恢复默认</button>
+          <button type="button" class="primary" on:click={continueEditingSessionsRoot}>继续修改</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if toastMessage}
+    <div class="toast-message" role="status" aria-live="polite">{toastMessage}</div>
   {/if}
 
   <footer class="status-line">

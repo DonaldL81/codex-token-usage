@@ -548,6 +548,11 @@ fn save_settings(config: AppConfigInput) -> Result<AppConfigDto, String> {
 }
 
 #[tauri::command]
+fn get_default_sessions_root() -> String {
+    default_sessions_root().display().to_string()
+}
+
+#[tauri::command]
 fn export_detail_csv(filters: Option<UsageFilters>) -> Result<ExportResultDto, String> {
     export_usage_csv(ExportKind::Detail, filters.unwrap_or_default(), None)
         .map_err(|error| error.to_string())
@@ -762,6 +767,7 @@ pub fn run() {
             refresh_usage,
             query_usage,
             save_settings,
+            get_default_sessions_root,
             export_detail_csv,
             export_summary_csv,
             rebuild_ledger,
