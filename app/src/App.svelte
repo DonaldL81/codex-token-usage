@@ -214,6 +214,7 @@
     x: number;
     y: number;
     placement: "above" | "below";
+    compact: boolean;
   };
 
   type ViewSnapshot = {
@@ -352,11 +353,12 @@
   let monitorSort: { key: MonitorSortKey; direction: SortDirection } = { key: "lastTime", direction: "desc" };
   let updatedDetailRows = new Set<string>();
   let monitorDetailRows: DetailRow[] = [];
+  let monitorUpdatedRows = new Set<string>();
   let monitorRequestSequence = 0;
   let monitorError = "";
   let hasUnreadMonitorUpdates = false;
   let detailTableWrap: HTMLDivElement | null = null;
-  let tooltip: TooltipState = { visible: false, text: "", x: 0, y: 0, placement: "below" };
+  let tooltip: TooltipState = { visible: false, text: "", x: 0, y: 0, placement: "below", compact: false };
   let tooltipHideTimer: ReturnType<typeof setTimeout> | null = null;
 
   const detailLevelControls: DetailLevelControl[] = [
@@ -370,10 +372,14 @@
     "当前筛选总 Token",
     "输入 Token",
     "输出 Token",
-    "每轮输入平均 Token",
-    "用户输入轮次",
-    "消耗超高输入轮次"
+    "每次输入平均 Token",
+    "用户输入次数",
+    "消耗超高次数"
   ];
+  const INPUT_TOKEN_TOOLTIP =
+    "输入 Token = 缓存输入 + 未缓存输入。\n缓存输入仍计入 Token 统计；最终计入 Token 消耗时会按所用模型规则折算，具体比例以官方规则为准。";
+  const OUTPUT_TOKEN_TOOLTIP =
+    "输出 Token = 推理输出 + 可见输出。\n可见输出是输出 Token 扣除推理输出后的部分，可能包含回答、工具调用等模型输出。";
   const DEFAULT_UPDATE_SOURCE = "DonaldL81/codex-token-usage";
   const DASHBOARD_CACHE_KEY = "codex-token-usage-dashboard-cache";
   const monitorStartedAt = new Date();
@@ -503,9 +509,14 @@
     await refreshUsage();
   }
 
-  async function refreshUsage(options: { background?: boolean } = {}) {
+  async function refreshUsage(
+    options: { background?: boolean; preserveMonitorRowUpdates?: boolean } = {}
+  ) {
     if (refreshPromise) {
       return refreshPromise;
+    }
+    if (!options.preserveMonitorRowUpdates && !hasUnreadMonitorUpdates) {
+      monitorUpdatedRows = new Set();
     }
     normalizeDateRange();
     syncDateRangeDraft();
@@ -716,9 +727,13 @@
         const previousRows = buildMonitorRows(monitorDetailRows, monitorStartedAt);
         const previousSignatures = new Map(previousRows.map((row) => [row.rowKey, detailRowSignature(row)]));
         const nextRows = buildMonitorRows(monitorData.detailRows, monitorStartedAt);
-        const hasUpdates = nextRows.some(
-          (row) => previousSignatures.get(row.rowKey) !== detailRowSignature(row)
-        );
+        const changedRowKeys = nextRows
+          .filter((row) => previousSignatures.get(row.rowKey) !== detailRowSignature(row))
+          .map((row) => row.rowKey);
+        const hasUpdates = changedRowKeys.length > 0;
+        if (hasUpdates) {
+          monitorUpdatedRows = new Set([...monitorUpdatedRows, ...changedRowKeys]);
+        }
         monitorDetailRows = monitorData.detailRows;
         monitorError = "";
         if (hasUpdates && activePage !== "monitor") {
@@ -954,7 +969,7 @@
         }
       });
     } else if (page === "monitor") {
-      void refreshUsage();
+      void refreshUsage({ preserveMonitorRowUpdates: true });
     }
   }
 
@@ -1365,13 +1380,13 @@
     return `${projectName}/${sessionName}`;
   }
 
-  function showTooltip(event: MouseEvent | FocusEvent, text: string) {
+  function showTooltip(event: MouseEvent | FocusEvent, text: string, compact = false) {
     cancelTooltipHide();
     const value = text.trim();
     if (!value) return;
     const target = event.currentTarget as HTMLElement;
     const rect = target.getBoundingClientRect();
-    const width = Math.min(760, window.innerWidth - 24);
+    const width = Math.min(compact ? 420 : 760, window.innerWidth - 24);
     const x = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
     const maxTooltipHeight = Math.min(386, window.innerHeight - 24);
     const spaceBelow = window.innerHeight - rect.bottom - 12;
@@ -1382,7 +1397,8 @@
       text: value,
       x,
       y: shouldShowAbove ? rect.top - 8 : rect.bottom + 8,
-      placement: shouldShowAbove ? "above" : "below"
+      placement: shouldShowAbove ? "above" : "below",
+      compact
     };
   }
 
@@ -1753,6 +1769,20 @@
       <h1>Codex Token Usage</h1>
       <p>Codex Token 消耗统计分析看板</p>
     </div>
+    <nav class="page-nav" aria-label="页面">
+      <button type="button" class:active={activePage === "stats"} aria-current={activePage === "stats" ? "page" : undefined} on:click={() => setPage("stats")}>统计看板</button>
+      <button type="button" class:active={activePage === "detail"} aria-current={activePage === "detail" ? "page" : undefined} on:click={() => setPage("detail")}>全量明细</button>
+      <button
+        type="button"
+        class:active={activePage === "monitor"}
+        aria-current={activePage === "monitor" ? "page" : undefined}
+        aria-label={hasUnreadMonitorUpdates ? "实时监控，有新更新" : "实时监控"}
+        on:click={() => setPage("monitor")}
+      >
+        实时监控
+        {#if hasUnreadMonitorUpdates}<span class="tab-update-dot" aria-hidden="true"></span>{/if}
+      </button>
+    </nav>
     <div class="toolbar-controls topbar-controls">
       <label class="toolbar-field refresh-field">
         <div class="toolbar-input-group">
@@ -1852,21 +1882,6 @@
       <button class="danger" on:click={rebuildLedger} disabled={!data || loading}>重建数据库</button>
     </div>
   </header>
-
-  <nav class="page-nav" aria-label="页面">
-    <button type="button" class:active={activePage === "stats"} aria-current={activePage === "stats" ? "page" : undefined} on:click={() => setPage("stats")}>统计看板</button>
-    <button type="button" class:active={activePage === "detail"} aria-current={activePage === "detail" ? "page" : undefined} on:click={() => setPage("detail")}>全量明细</button>
-    <button
-      type="button"
-      class:active={activePage === "monitor"}
-      aria-current={activePage === "monitor" ? "page" : undefined}
-      aria-label={hasUnreadMonitorUpdates ? "实时监控，有新更新" : "实时监控"}
-      on:click={() => setPage("monitor")}
-    >
-      实时监控
-      {#if hasUnreadMonitorUpdates}<span class="tab-update-dot" aria-hidden="true"></span>{/if}
-    </button>
-  </nav>
 
   {#if error}
     <section class="alert">{error}</section>
@@ -1988,7 +2003,18 @@
         <article class="metric-card metric-card-composite">
           <div class="metric-composite-body">
             <div class="metric-total">
-              <span>输入 Token</span>
+              <span class="metric-title-with-help">
+                输入 Token
+                <button
+                  type="button"
+                  class="header-help metric-help"
+                  aria-label="查看输入 Token 组成说明"
+                  on:mouseenter={(event) => showTooltip(event, INPUT_TOKEN_TOOLTIP, true)}
+                  on:mouseleave={scheduleHideTooltip}
+                  on:focus={(event) => showTooltip(event, INPUT_TOKEN_TOOLTIP, true)}
+                  on:blur={scheduleHideTooltip}
+                >?</button>
+              </span>
               <strong class="blue">{formatToken(metrics.inputTokens)}</strong>
             </div>
             <div class="metric-breakdown">
@@ -2000,7 +2026,18 @@
         <article class="metric-card metric-card-composite">
           <div class="metric-composite-body">
             <div class="metric-total">
-              <span>输出 Token</span>
+              <span class="metric-title-with-help">
+                输出 Token
+                <button
+                  type="button"
+                  class="header-help metric-help"
+                  aria-label="查看输出 Token 组成说明"
+                  on:mouseenter={(event) => showTooltip(event, OUTPUT_TOKEN_TOOLTIP, true)}
+                  on:mouseleave={scheduleHideTooltip}
+                  on:focus={(event) => showTooltip(event, OUTPUT_TOKEN_TOOLTIP, true)}
+                  on:blur={scheduleHideTooltip}
+                >?</button>
+              </span>
               <strong class="blue">{formatToken(metrics.outputTokens)}</strong>
             </div>
             <div class="metric-breakdown">
@@ -2012,24 +2049,24 @@
           </div>
         </article>
         <article class="metric-card metric-card-primary">
-          <span>每轮输入平均 Token</span>
+          <span>每次输入平均 Token</span>
           <strong class="blue">
             {formatToken(metrics.userMessageCount > 0 ? Math.round(metrics.totalTokens / metrics.userMessageCount) : 0)}
           </strong>
         </article>
         <article class="metric-card">
-          <span>用户输入轮次</span>
+          <span>用户输入次数</span>
           <strong>{formatCount(metrics.userMessageCount)}</strong>
         </article>
         <article class="metric-card" class:metric-card-alert={metrics.abnormalCount > 0}>
-          <span>消耗超高输入轮次</span>
+          <span>消耗超高次数</span>
           <strong class:red={metrics.abnormalCount > 0}>{formatCount(metrics.abnormalCount)}</strong>
         </article>
       {:else}
         {#each metricSkeletonLabels as label}
           <article
             class="metric-card"
-            class:metric-card-primary={label === "当前筛选总 Token" || label === "每轮输入平均 Token"}
+            class:metric-card-primary={label === "当前筛选总 Token" || label === "每次输入平均 Token"}
           >
             <span>{label}</span>
             <strong aria-hidden="true"></strong>
@@ -2173,9 +2210,9 @@
                     type="button"
                     class="header-help"
                     aria-label="输入说明"
-                    on:mouseenter={(event) => showTooltip(event, "输入 = 缓存输入 + 非缓存输入")}
+                    on:mouseenter={(event) => showTooltip(event, INPUT_TOKEN_TOOLTIP, true)}
                     on:mouseleave={scheduleHideTooltip}
-                    on:focus={(event) => showTooltip(event, "输入 = 缓存输入 + 非缓存输入")}
+                    on:focus={(event) => showTooltip(event, INPUT_TOKEN_TOOLTIP, true)}
                     on:blur={scheduleHideTooltip}
                   >?</button>
                 </span>
@@ -2189,9 +2226,9 @@
                     type="button"
                     class="header-help"
                     aria-label="输出说明"
-                    on:mouseenter={(event) => showTooltip(event, "输出 = 推理输出 + 非推理输出")}
+                    on:mouseenter={(event) => showTooltip(event, OUTPUT_TOKEN_TOOLTIP, true)}
                     on:mouseleave={scheduleHideTooltip}
-                    on:focus={(event) => showTooltip(event, "输出 = 推理输出 + 非推理输出")}
+                    on:focus={(event) => showTooltip(event, OUTPUT_TOKEN_TOOLTIP, true)}
                     on:blur={scheduleHideTooltip}
                   >?</button>
                 </span>
@@ -2249,7 +2286,12 @@
                   </td>
                 {/if}
                 <td>
-                  <span class="time-cell" class:updated={updatedDetailRows.has(row.rowKey)}>
+                  <span
+                    class="time-cell"
+                    class:updated={isMonitorPage
+                      ? monitorUpdatedRows.has(row.rowKey)
+                      : updatedDetailRows.has(row.rowKey)}
+                  >
                     {formatDetailLastTime(row)}
                   </span>
                 </td>
@@ -2534,6 +2576,7 @@
   {#if tooltip.visible}
     <div
       class={`floating-tooltip ${tooltip.placement}`}
+      class:compact={tooltip.compact}
       style={`left:${tooltip.x}px; top:${tooltip.y}px;`}
       role="tooltip"
       on:mouseenter={cancelTooltipHide}
