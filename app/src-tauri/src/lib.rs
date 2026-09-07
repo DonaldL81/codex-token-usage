@@ -5,7 +5,7 @@ use chrono::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,6 +24,8 @@ use walkdir::WalkDir;
 
 const HIGH_TOKEN_THRESHOLD: i64 = 200_000;
 const ABNORMAL_TOKEN_THRESHOLD: i64 = 1_000_000;
+const NEW_SESSION_CONTEXT_THRESHOLD_PERCENT: f64 = 60.0;
+const USER_MESSAGE_PARSER_VERSION: i64 = 2;
 const PRECEDING_ACTION_WINDOW_SECONDS: i64 = 60;
 const PRODUCT_ASSET_PREFIX: &str = "CodexTokenUsage";
 const DEFAULT_UPDATE_SOURCE: &str = "DonaldL81/codex-token-usage";
@@ -283,6 +285,7 @@ pub struct DetailRowDto {
     total_tokens: i64,
     status: String,
     status_reason: String,
+    new_session_advice: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,6 +376,7 @@ struct TokenEvent {
     cwd: String,
     user_message: String,
     user_message_preview: String,
+    model_context_window: Option<i64>,
     last_input_tokens: i64,
     last_cached_input_tokens: i64,
     last_output_tokens: i64,
@@ -1793,6 +1797,12 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     ensure_column(
         conn,
+        "scan_state",
+        "user_message_parser_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
         "app_config",
         "retention_days",
         "INTEGER NOT NULL DEFAULT 0",
@@ -1888,6 +1898,11 @@ fn scan_sessions(
 
     let previous_cutoff = read_last_cutoff(conn)?;
     let manifest = load_source_file_manifest(conn)?;
+    let files_with_missing_user_messages = if user_message_backfill_required(conn)? {
+        load_files_with_missing_user_messages(conn)?
+    } else {
+        HashSet::new()
+    };
     let mut files_scanned = 0_i64;
     let mut new_events = 0_i64;
     let mut parse_errors = 0_i64;
@@ -1908,7 +1923,8 @@ fn scan_sessions(
             let modified_text = format_utc_iso(modified_utc);
             if manifest.get(&file_path).is_some_and(|fingerprint| {
                 fingerprint.modified_utc == modified_text && fingerprint.file_size == metadata.len()
-            }) {
+            }) && !files_with_missing_user_messages.contains(&file_path)
+            {
                 continue;
             }
 
@@ -1985,6 +2001,10 @@ fn scan_sessions(
             include_archived as i64
         ],
     )?;
+    conn.execute(
+        "UPDATE scan_state SET user_message_parser_version = ?1 WHERE id = 1",
+        [USER_MESSAGE_PARSER_VERSION],
+    )?;
 
     read_scan_state(conn, sessions_root, include_archived).map_err(Into::into)
 }
@@ -2012,6 +2032,26 @@ fn load_source_file_manifest(
     rows.collect()
 }
 
+fn load_files_with_missing_user_messages(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT file_path FROM token_events WHERE COALESCE(TRIM(user_message), '') = ''",
+    )?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
+fn user_message_backfill_required(conn: &Connection) -> rusqlite::Result<bool> {
+    let parser_version = conn
+        .query_row(
+            "SELECT user_message_parser_version FROM scan_state WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    Ok(parser_version < USER_MESSAGE_PARSER_VERSION)
+}
+
 fn scan_roots(sessions_root: &Path, include_archived: bool) -> Vec<PathBuf> {
     let mut roots = vec![sessions_root.to_path_buf()];
     if include_archived {
@@ -2026,7 +2066,7 @@ fn scan_roots(sessions_root: &Path, include_archived: bool) -> Vec<PathBuf> {
 }
 
 fn insert_token_event(conn: &Connection, event: &ParsedTokenEvent) -> rusqlite::Result<usize> {
-    conn.execute(
+    let inserted = conn.execute(
         r#"
         INSERT OR IGNORE INTO token_events (
             event_key, local_time, utc_time, date, hour, session_id, turn_id, turn_key,
@@ -2087,7 +2127,27 @@ fn insert_token_event(conn: &Connection, event: &ParsedTokenEvent) -> rusqlite::
             event.secondary_resets_at_local,
             event.status
         ],
-    )
+    )?;
+    if inserted == 0
+        && event
+            .user_message
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        conn.execute(
+            r#"
+            UPDATE token_events
+            SET user_message = ?2, user_message_preview = ?3
+            WHERE event_key = ?1 AND COALESCE(TRIM(user_message), '') = ''
+            "#,
+            params![
+                event.event_key,
+                event.user_message,
+                event.user_message_preview
+            ],
+        )?;
+    }
+    Ok(inserted)
 }
 
 fn insert_context_action(
@@ -2254,6 +2314,7 @@ fn parse_codex_jsonl(path: &Path) -> Result<ParsedFile, Box<dyn std::error::Erro
                 match get_str(payload, "type").as_deref() {
                     Some("task_started") => {
                         context.current_turn_id = get_str(payload, "turn_id");
+                        context.current_user_message = None;
                         context.current_turn_started_local = payload
                             .get("started_at")
                             .and_then(parse_unix_seconds)
@@ -2417,6 +2478,10 @@ fn parse_codex_jsonl(path: &Path) -> Result<ParsedFile, Box<dyn std::error::Erro
                 }
             }
             Some("response_item") => {
+                let payload = &record["payload"];
+                if let Some(user_message) = response_item_user_message(payload) {
+                    context.current_user_message = Some(user_message);
+                }
                 if let Some(action) = context_action_from_response_item(
                     &record,
                     &context,
@@ -2436,6 +2501,23 @@ fn parse_codex_jsonl(path: &Path) -> Result<ParsedFile, Box<dyn std::error::Erro
         context_actions,
         parse_errors,
     })
+}
+
+fn response_item_user_message(payload: &Value) -> Option<String> {
+    if get_str(payload, "type").as_deref() != Some("message")
+        || get_str(payload, "role").as_deref() != Some("user")
+    {
+        return None;
+    }
+    let message = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|item| get_str(item, "type").as_deref() == Some("input_text"))
+        .filter_map(|item| get_str(item, "text"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!message.trim().is_empty()).then_some(message)
 }
 
 fn context_action_from_response_item(
@@ -3013,6 +3095,7 @@ fn load_events(conn: &Connection) -> rusqlite::Result<Vec<TokenEvent>> {
             token_events.project, COALESCE(token_events.cwd, ''),
             COALESCE(token_events.user_message, ''),
             COALESCE(token_events.user_message_preview, ''),
+            token_events.model_context_window,
             token_events.last_input_tokens, token_events.last_cached_input_tokens,
             token_events.last_output_tokens, token_events.last_reasoning_output_tokens,
             token_events.last_total_tokens, token_events.primary_used_percent, token_events.status,
@@ -3038,14 +3121,15 @@ fn load_events(conn: &Connection) -> rusqlite::Result<Vec<TokenEvent>> {
             cwd: row.get(9)?,
             user_message: row.get(10)?,
             user_message_preview: row.get(11)?,
-            last_input_tokens: row.get(12)?,
-            last_cached_input_tokens: row.get(13)?,
-            last_output_tokens: row.get(14)?,
-            last_reasoning_output_tokens: row.get(15)?,
-            last_total_tokens: row.get(16)?,
-            primary_used_percent: row.get(17)?,
-            status: normalize_status_label(row.get(18)?),
-            preceding_action: row.get(19)?,
+            model_context_window: row.get(12)?,
+            last_input_tokens: row.get(13)?,
+            last_cached_input_tokens: row.get(14)?,
+            last_output_tokens: row.get(15)?,
+            last_reasoning_output_tokens: row.get(16)?,
+            last_total_tokens: row.get(17)?,
+            primary_used_percent: row.get(18)?,
+            status: normalize_status_label(row.get(19)?),
+            preceding_action: row.get(20)?,
         })
     })?;
 
@@ -3430,6 +3514,11 @@ fn push_detail_row(
         .iter()
         .max_by(|left, right| left.utc_time.cmp(&right.utc_time))
         .unwrap_or(identity);
+    let new_session_advice = if level == 1 {
+        session_new_chat_advice(events)
+    } else {
+        None
+    };
     rows.push(DetailRowDto {
         row_key,
         parent_key,
@@ -3467,6 +3556,7 @@ fn push_detail_row(
         total_tokens: sums.total_tokens,
         status: aggregate_status(events),
         status_reason: aggregate_status_reason(events),
+        new_session_advice,
     });
 }
 
@@ -3913,6 +4003,27 @@ fn aggregate_status_reason(events: &[TokenEvent]) -> String {
     }
 }
 
+fn session_new_chat_advice(events: &[TokenEvent]) -> Option<String> {
+    let latest = events.iter().max_by(|left, right| {
+        left.utc_time
+            .cmp(&right.utc_time)
+            .then_with(|| left.token_event_index.cmp(&right.token_event_index))
+    })?;
+    let context_window = latest.model_context_window.filter(|value| *value > 0)?;
+    let context_percent = latest.last_input_tokens.max(0) as f64 * 100.0 / context_window as f64;
+    if context_percent < NEW_SESSION_CONTEXT_THRESHOLD_PERCENT {
+        return None;
+    }
+
+    Some(format!(
+        "建议新开会话\n1. 标准：最近输入达到上下文窗口的 {:.0}%。\n2. 当前：{} / {} Token（{:.1}%）。\n3. 原因：上下文较长，继续使用会增加历史内容的重复读取，并更接近上下文压缩。",
+        NEW_SESSION_CONTEXT_THRESHOLD_PERCENT,
+        latest.last_input_tokens,
+        context_window,
+        context_percent
+    ))
+}
+
 fn read_last_cutoff(conn: &Connection) -> rusqlite::Result<Option<DateTime<Utc>>> {
     let value: Option<String> = conn
         .query_row(
@@ -4257,6 +4368,25 @@ mod tests {
     }
 
     #[test]
+    fn session_new_chat_advice_uses_latest_context_occupancy() {
+        let mut older = metric_event("session-a", "turn-a", "正常");
+        older.model_context_window = Some(1_000);
+        older.last_input_tokens = 950;
+        older.utc_time = "2026-07-10 09:00:00".to_string();
+
+        let mut latest = metric_event("session-a", "turn-b", "正常");
+        latest.model_context_window = Some(1_000);
+        latest.last_input_tokens = 599;
+        assert!(session_new_chat_advice(&[older.clone(), latest.clone()]).is_none());
+
+        latest.last_input_tokens = 600;
+        let advice =
+            session_new_chat_advice(&[older, latest]).expect("60% should advise a new chat");
+        assert!(advice.contains("600 / 1000 Token（60.0%）"));
+        assert!(advice.contains("上下文压缩"));
+    }
+
+    #[test]
     fn parser_falls_back_when_session_meta_and_turn_id_are_missing() {
         let temp = tempdir().unwrap();
         let file_path = temp.path().join("fallback-session.jsonl");
@@ -4290,6 +4420,52 @@ mod tests {
         assert_eq!(parsed.events[1].turn_id, "turn-1");
         assert_eq!(parsed.events[0].token_event_index, 1);
         assert_eq!(parsed.events[1].token_event_index, 2);
+    }
+
+    #[test]
+    fn scanner_reads_response_item_user_messages_and_backfills_existing_rows() {
+        let temp = tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        fs::write(
+            sessions_root.join("response-item-session.jsonl"),
+            response_item_user_message_jsonl(),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+        let first = scan_sessions(&mut conn, &sessions_root, false).unwrap();
+        let first_message: String = conn
+            .query_row("SELECT user_message FROM token_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(first_message, "新版用户输入");
+
+        conn.execute(
+            "UPDATE token_events SET user_message = NULL, user_message_preview = NULL",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE scan_state SET user_message_parser_version = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let second = scan_sessions(&mut conn, &sessions_root, false).unwrap();
+        let restored_message: String = conn
+            .query_row("SELECT user_message FROM token_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let third = scan_sessions(&mut conn, &sessions_root, false).unwrap();
+
+        assert_eq!(first.last_run_new_token_events, 1);
+        assert_eq!(second.last_run_files_scanned, 1);
+        assert_eq!(second.last_run_new_token_events, 0);
+        assert_eq!(restored_message, "新版用户输入");
+        assert_eq!(third.last_run_files_scanned, 0);
     }
 
     #[test]
@@ -4505,6 +4681,7 @@ mod tests {
             cwd: r"\\?\D:\Desktop\AI\codex_about".to_string(),
             user_message: String::new(),
             user_message_preview: String::new(),
+            model_context_window: None,
             last_input_tokens: 1,
             last_cached_input_tokens: 0,
             last_output_tokens: 0,
@@ -4641,6 +4818,7 @@ mod tests {
             cwd: "test-project".to_string(),
             user_message: String::new(),
             user_message_preview: String::new(),
+            model_context_window: None,
             last_input_tokens: 100,
             last_cached_input_tokens: 60,
             last_output_tokens: 40,
@@ -4661,6 +4839,15 @@ mod tests {
 {"type":"event_msg","timestamp":"2026-07-10T10:00:03Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":160},"total_token_usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":160},"model_context_window":200000},"rate_limits":{"plan_type":"pro","primary":{"used_percent":12.5,"window_minutes":300,"resets_at":1783679600},"secondary":{"used_percent":1.5,"window_minutes":10080,"resets_at":1783689600}}}}
 {"type":"event_msg","timestamp":"2026-07-10T10:00:04Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":360,"cached_input_tokens":220,"output_tokens":70,"reasoning_output_tokens":10,"total_tokens":440},"total_token_usage":{"input_tokens":480,"cached_input_tokens":300,"output_tokens":100,"reasoning_output_tokens":20,"total_tokens":600},"model_context_window":200000},"rate_limits":{"plan_type":"pro","primary":{"used_percent":12.8,"window_minutes":300,"resets_at":1783679600},"secondary":{"used_percent":1.8,"window_minutes":10080,"resets_at":1783689600}}}}"#
             .to_string()
+    }
+
+    fn response_item_user_message_jsonl() -> &'static str {
+        r#"{"type":"session_meta","timestamp":"2026-09-07T10:00:00Z","payload":{"session_id":"response-item-session","timestamp":"2026-09-07T10:00:00Z","cwd":"D:\\Desktop\\AI\\response-item"}}
+{"type":"event_msg","timestamp":"2026-09-07T10:00:01Z","payload":{"type":"task_started","turn_id":"turn-new","started_at":1788775201,"model_context_window":200000}}
+{"type":"response_item","timestamp":"2026-09-07T10:00:01.100Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"注入上下文"}]}}
+{"type":"turn_context","timestamp":"2026-09-07T10:00:01.200Z","payload":{"turn_id":"turn-new","cwd":"D:\\Desktop\\AI\\response-item"}}
+{"type":"response_item","timestamp":"2026-09-07T10:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"新版用户输入"}]}}
+{"type":"event_msg","timestamp":"2026-09-07T10:00:03Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":160},"total_token_usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":160},"model_context_window":200000},"rate_limits":{"primary":{"used_percent":12.5},"secondary":{}}}}"#
     }
 
     fn cross_date_jsonl() -> String {

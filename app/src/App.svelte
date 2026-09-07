@@ -139,6 +139,7 @@
     totalTokens: number;
     status: string;
     statusReason: string;
+    newSessionAdvice: string | null;
   };
 
   type SummaryRow = {
@@ -386,6 +387,8 @@
     "输入 Token = 缓存输入 + 未缓存输入。\n缓存输入仍计入 Token 统计；最终计入 Token 消耗时会按所用模型规则折算，具体比例以官方规则为准。";
   const OUTPUT_TOKEN_TOOLTIP =
     "输出 Token = 推理输出 + 可见输出。\n可见输出是输出 Token 扣除推理输出后的部分，可能包含回答、工具调用等模型输出。";
+  const TOKEN_COMPOSITION_TOOLTIP =
+    "1. 消耗判断\n< 20 万：正常；≥ 20 万：偏高；≥ 100 万：超高。\n额度使用率 ≥ 95%：超高；推理输出 > 可见输出 3 倍：偏高。\n\n2. 上下文判断\n最近输入 ÷ 上下文窗口；达到 60%时建议新开会话。缓存输入也占用上下文。\n\n以上仅作辅助判断，长任务可能合理偏高。";
   const DEFAULT_UPDATE_SOURCE = "DonaldL81/codex-token-usage";
   const DASHBOARD_CACHE_KEY = "codex-token-usage-dashboard-cache";
   const monitorStartedAt = new Date();
@@ -709,7 +712,8 @@
       row.reasoningOutputTokens,
       row.totalTokens,
       row.status,
-      row.statusReason
+      row.statusReason,
+      row.newSessionAdvice ?? ""
     ].join("|");
   }
 
@@ -1440,7 +1444,7 @@
   }
 
   function extractActualUserInput(text: string): string {
-    const match = text.match(/(?:^|\n)#{1,6}\s*My request for Codex:\s*/i);
+    const match = text.match(/(?:^|\n)(?:#{1,6}\s*)?My request(?: for Codex)?:\s*/i);
     if (!match || match.index === undefined) return "";
     return text.slice(match.index + match[0].length).trim();
   }
@@ -2333,7 +2337,11 @@
             {#if data && detailTableRows.length > 0}
               {#each detailTableRows as row}
               <tr>
-                <td class="node" style={`--indent:${isMonitorPage ? 0 : row.level * 18}px`}>
+                <td
+                  class="node"
+                  class:hasAdvice={!isMonitorPage && row.kind === "Session" && !!row.newSessionAdvice}
+                  style={`--indent:${isMonitorPage ? 0 : row.level * 18}px`}
+                >
                   {#if isMonitorPage}
                     <button
                       type="button"
@@ -2371,6 +2379,17 @@
                       <span class={`dot level-${row.level}`}>{levelLabel(row.level)}</span>
                       <strong class="node-type">{detailKindLabel(row.kind)}：</strong>{detailNodeDisplayText(row)}
                     </button>
+                    {#if row.kind === "Session" && row.newSessionAdvice}
+                      <button
+                        type="button"
+                        class="new-session-badge"
+                        aria-label="查看建议新开会话的原因"
+                        on:mouseenter={(event) => showTooltip(event, row.newSessionAdvice!, true)}
+                        on:mouseleave={scheduleHideTooltip}
+                        on:focus={(event) => showTooltip(event, row.newSessionAdvice!, true)}
+                        on:blur={scheduleHideTooltip}
+                      >建议新开</button>
+                    {/if}
                   {/if}
                   </td>
                 {#if isMonitorPage}
@@ -2516,8 +2535,17 @@
 
       <section class="panel composition-panel composition-rank-panel">
         <div class="panel-title compact">
-          <div>
+          <div class="panel-title-heading">
             <h2>Token 构成</h2>
+            <button
+              type="button"
+              class="header-help"
+              aria-label="Token 消耗与上下文长度说明"
+              on:mouseenter={(event) => showTooltip(event, TOKEN_COMPOSITION_TOOLTIP, true)}
+              on:mouseleave={scheduleHideTooltip}
+              on:focus={(event) => showTooltip(event, TOKEN_COMPOSITION_TOOLTIP, true)}
+              on:blur={scheduleHideTooltip}
+            >?</button>
           </div>
         </div>
         <div class="composition">
@@ -2531,15 +2559,15 @@
                   </div>
                 </div>
                 <div class="ring-legend">
-                  <div class="tone-medium"><i class="blue-bg"></i><span>输入：<b>{percentOf(metrics.inputTokens, metrics.totalTokens)}</b></span></div>
-                  <div class="tone-cyan"><i class="cyan-bg"></i><span>输出：<b>{percentOf(outputTotal(metrics), metrics.totalTokens)}</b></span></div>
+                  <div class="tone-abnormal"><i class="strong-bg"></i><span>输入：<b>{percentOf(metrics.inputTokens, metrics.totalTokens)}</b></span></div>
+                  <div class="tone-medium"><i class="medium-bg"></i><span>输出：<b>{percentOf(outputTotal(metrics), metrics.totalTokens)}</b></span></div>
                 </div>
               </div>
 
               <div class="composition-ring-item tone-low">
                 <div class="ring-legend ring-legend-above">
-                  <div class="tone-low"><i class="green-bg"></i><span>缓存输入：<b>{percentOf(metrics.cachedInputTokens, metrics.inputTokens)}</b></span></div>
-                  <div class="tone-high"><i class="orange-bg"></i><span>非缓存输入：<b>{percentOf(metrics.nonCachedInputTokens, metrics.inputTokens)}</b></span></div>
+                  <div class="tone-high"><i class="high-bg"></i><span>缓存输入：<b>{percentOf(metrics.cachedInputTokens, metrics.inputTokens)}</b></span></div>
+                  <div class="tone-low"><i class="low-bg"></i><span>非缓存输入：<b>{percentOf(metrics.nonCachedInputTokens, metrics.inputTokens)}</b></span></div>
                 </div>
                 <div class="single-ring" style={`--ring:${inputRingStyle(metrics)}`}>
                   <div class="single-ring-center">
@@ -2557,8 +2585,8 @@
                   </div>
                 </div>
                 <div class="ring-legend">
-                  <div class="tone-medium"><i class="blue-bg"></i><span>推理输出：<b>{percentOf(metrics.reasoningOutputTokens, outputTotal(metrics))}</b></span></div>
-                  <div class="tone-high"><i class="orange-bg"></i><span>非推理输出：<b>{percentOf(metrics.outputTokens, outputTotal(metrics))}</b></span></div>
+                  <div class="tone-medium"><i class="medium-bg"></i><span>推理输出：<b>{percentOf(metrics.reasoningOutputTokens, outputTotal(metrics))}</b></span></div>
+                  <div class="tone-low"><i class="low-bg"></i><span>非推理输出：<b>{percentOf(metrics.outputTokens, outputTotal(metrics))}</b></span></div>
                 </div>
               </div>
             </div>

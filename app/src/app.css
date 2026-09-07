@@ -753,6 +753,12 @@ button.danger {
   padding-bottom: 4px;
 }
 
+.panel-title-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .panel-title h2 {
   margin: 0;
   font-size: 16px;
@@ -1251,6 +1257,32 @@ td:last-child {
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: middle;
+}
+
+.node.hasAdvice .node-label {
+  max-width: calc(100% - var(--indent, 0px) - 112px);
+}
+
+.new-session-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid #fed7aa;
+  border-radius: 4px;
+  background: #fff7ed;
+  color: #c2410c;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.new-session-badge:hover,
+.new-session-badge:focus-visible {
+  border-color: #fb923c;
+  background: #ffedd5;
 }
 
 .detail.monitor .node-label {
@@ -1984,6 +2016,22 @@ td:last-child {
 }
 
 .red-bg {
+  background: var(--chart-blue-strong);
+}
+
+.low-bg {
+  background: var(--chart-blue-low);
+}
+
+.medium-bg {
+  background: var(--chart-blue-medium);
+}
+
+.high-bg {
+  background: var(--chart-blue-high);
+}
+
+.strong-bg {
   background: var(--chart-blue-strong);
 }
 
